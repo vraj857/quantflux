@@ -72,6 +72,11 @@ const App = () => {
                     const newSession = { broker: data.broker, authenticatedAt: new Date().toISOString() };
                     sessionStorage.setItem('BROKER_SESSION', JSON.stringify(newSession));
                     setSession(newSession);
+                } else {
+                    // Force clear if backend says no session
+                    sessionStorage.removeItem('BROKER_SESSION');
+                    setSession(null);
+                    setBrokerProfile(null);
                 }
             } catch (e) {
                 console.log('Backend not reachable for session check');
