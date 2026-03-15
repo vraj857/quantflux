@@ -1,0 +1,155 @@
+from fastapi import APIRouter, Depends, HTTPException, Query, WebSocket, WebSocketDisconnect
+from sqlalchemy.ext.asyncio import AsyncSession
+from app.database import get_async_db
+from app.state import state
+from app.core.calendar import MarketCalendar
+from datetime import datetime
+from typing import List, Dict, Any, Optional
+from pydantic import BaseModel
+import logging
+
+router = APIRouter(prefix="/api/market", tags=["market"])
+
+class TimeframeUpdate(BaseModel):
+    minutes: int
+
+class FeedModeUpdate(BaseModel):
+    mode: str # "LIVE" or "HISTORICAL"
+    date: Optional[str] = None
+    symbol: Optional[str] = None
+
+@router.get("/status")
+async def get_market_status():
+    """Returns current market session info."""
+    status, reason = MarketCalendar.get_market_status()
+    return {
+        "status": status,
+        "reason": reason,
+        "server_time": datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    }
+
+@router.get("/timeframe")
+async def get_timeframe():
+    return {
+        "interval_minutes": state.aggregator.slot_minutes,
+        "is_historical": state.is_historical_mode
+    }
+
+@router.post("/set-timeframe")
+async def set_timeframe(data: TimeframeUpdate):
+    state.aggregator.slot_minutes = data.minutes
+    state.aggregator.reset_state()
+    return {"status": "success", "minutes": data.minutes}
+
+@router.get("/historical-ohlc")
+async def get_historical_ohlc(symbol: str, start_date: str, end_date: str, timeframe: int = 25):
+    """Fetches historical OHLC for charting and grid visualization."""
+    if not state.active_broker:
+        raise HTTPException(status_code=400, detail="No active broker session")
+    
+    try:
+        from datetime import timedelta
+        # Standardize interval to '1' (minute) for raw candle fetch
+        interval = "1" if state.active_broker_name == "FYERS" else "minute"
+        raw_candles = await state.active_broker.fetch_history(symbol, interval, start_date, end_date)
+        
+        aggregated_slots = []
+        current_slot = None
+        
+        for c in raw_candles:
+            ts = c.get('timestamp') or c.get('date')
+            if isinstance(ts, datetime):
+                dt = ts
+            elif isinstance(ts, str):
+                try: dt = datetime.fromisoformat(ts.replace('Z', '+00:00'))
+                except: dt = datetime.fromtimestamp(int(ts))
+            else:
+                dt = datetime.fromtimestamp(int(ts))
+                
+            m_start = dt.replace(hour=9, minute=15, second=0, microsecond=0)
+            if dt < m_start: continue
+            
+            diff_minutes = (dt - m_start).total_seconds() / 60
+            slot_idx = int(diff_minutes // timeframe)
+            slot_start_time = m_start + timedelta(minutes=slot_idx * timeframe)
+            label = slot_start_time.strftime("%d %b %H:%M")
+            
+            if not current_slot or current_slot["label"] != label:
+                if current_slot: aggregated_slots.append(current_slot)
+                current_slot = {
+                    "label": label,
+                    "epoch": int(slot_start_time.timestamp()),
+                    "open": c.get('open', 0),
+                    "high": c.get('high', 0),
+                    "low": c.get('low', 0),
+                    "close": c.get('close', 0),
+                    "volume": c.get('volume', 0)
+                }
+            else:
+                current_slot["high"] = max(current_slot["high"], c.get('high', 0))
+                current_slot["low"] = min(current_slot["low"], c.get('low', 0))
+                current_slot["close"] = c.get('close', 0)
+                current_slot["volume"] += c.get('volume', 0)
+                
+        if current_slot: aggregated_slots.append(current_slot)
+        
+        plotly_candles, prices, pcs, vols, vss, labels = [], [], [], [], [], []
+        for idx, s in enumerate(aggregated_slots):
+            plotly_candles.append([s["epoch"], s["open"], s["high"], s["low"], s["close"], s["volume"]])
+            labels.append(s["label"])
+            prices.append(s["close"])
+            vols.append(s["volume"])
+            
+            pc = round(((s["close"] - s["open"]) / s["open"]) * 100, 2) if s["open"] > 0 else 0.0
+            pcs.append(pc)
+            
+            # Trailing avg for volume strength
+            past_vols = [h["volume"] for h in aggregated_slots[:idx]]
+            avg = sum(past_vols[-20:])/len(past_vols[-20:]) if past_vols else s["volume"]
+            vs = round((s["volume"] / avg) * 100, 2) if avg > 0 else 100.0
+            vss.append(vs)
+            
+        payload = {
+            "s": "ok",
+            "candles": plotly_candles,
+            "grid_data": {
+                "data": {symbol: {"price": prices, "percent_change": pcs, "volume": vols, "volume_strength": vss}},
+                "slot_labels": labels,
+                "daily_summary": {symbol: {
+                    "current_price": prices[-1] if prices else 0,
+                    "percent_change": pcs[-1] if pcs else 0, 
+                    "total_volume": sum(vols)
+                }},
+                "phases": [{"name": f"{timeframe}m Setup", "colSpan": len(labels), "bg": "bg-indigo-500/10 text-indigo-500"}]
+            }
+        }
+        return payload
+    except Exception as e:
+        logging.error(f"Failed to fetch historical data: {e}")
+        return {"s": "error", "message": "Failed to fetch historical data from broker"}
+
+@router.post("/set-feed-mode")
+async def set_feed_mode(data: FeedModeUpdate):
+    if data.mode == "HISTORICAL":
+        state.is_historical_mode = True
+        return {"status": "success", "mode": "HISTORICAL"}
+    else:
+        state.is_historical_mode = False
+        return {"status": "success", "mode": "LIVE"}
+
+@router.get("/system-logs")
+async def get_system_logs():
+    """Returns system logs (mocked as empty since we use Loguru structured logging now)."""
+    return []
+
+@router.post("/update-watchlist")
+async def update_watchlist(data: dict):
+    """Triggers the active broker to re-subscribe to current symbols."""
+    if not state.active_broker:
+        return {"status": "error", "message": "No active broker"}
+    
+    symbols = data.get("symbols", [])
+    if symbols:
+        from app.main import on_tick_received
+        await state.active_broker.start_ticker(symbols, on_tick_received)
+    return {"status": "success", "synced": len(symbols)}

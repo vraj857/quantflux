@@ -1,0 +1,202 @@
+import logging
+import asyncio
+from typing import List, Dict, Any, Optional
+from app.broker_management.base import IBroker
+from app.core.rate_limiter import TokenBucket
+import os
+from datetime import datetime, timedelta
+
+try:
+    from fyers_apiv3 import fyersModel
+    from fyers_apiv3.FyersWebsocket import data_ws
+except ImportError:
+    fyersModel = None
+    data_ws = None
+
+class FyersAdapter(IBroker):
+    def __init__(self, client_id: str, secret_key: str, redirect_uri: str):
+        self.client_id = f"{client_id}-100" if "-" not in client_id else client_id
+        self.secret_key = secret_key
+        self.redirect_uri = redirect_uri
+        self.access_token: Optional[str] = None
+        self.api: Optional[Any] = None
+        self.ws: Optional[Any] = None
+        self.on_tick_callback: Optional[callable] = None
+        self._last_tick_times: Dict[str, datetime] = {}
+        
+        # Tiered Log Path
+        from config import LOGS_DIR
+        self.log_path = os.path.join(LOGS_DIR, "broker")
+        if not os.path.exists(self.log_path):
+            os.makedirs(self.log_path, exist_ok=True)
+            
+        # Fyers Rate Limit: ~10 requests per second for standard users
+        self.rate_limiter = TokenBucket(rate=10, capacity=10)
+
+    @property
+    def last_tick_times(self) -> Dict[str, datetime]:
+        return self._last_tick_times
+
+    async def authenticate(self, credentials: Dict[str, Any]) -> str:
+        """Exchanges auth_code for access_token."""
+        auth_code = credentials.get("auth_code")
+        if not auth_code:
+            raise ValueError("auth_code is required for Fyers authentication")
+
+        session = fyersModel.SessionModel(
+            client_id=self.client_id,
+            secret_key=self.secret_key,
+            redirect_uri=self.redirect_uri,
+            response_type="code",
+            grant_type="authorization_code"
+        )
+        session.set_token(auth_code)
+        
+        # Use to_thread since generate_token is typically blocking
+        response = await asyncio.to_thread(session.generate_token)
+        
+        if response.get("s") == "ok":
+            self.access_token = response.get("access_token")
+            self.api = fyersModel.FyersModel(
+                client_id=self.client_id, 
+                token=self.access_token, 
+                is_async=False, 
+                log_path=self.log_path
+            )
+            return self.access_token
+        else:
+            raise Exception(f"Fyers Authentication Failed: {response.get('message')}")
+
+    async def get_profile(self) -> Dict[str, Any]:
+        await self.rate_limiter.consume()
+        profile = await asyncio.to_thread(self.api.get_profile)
+        if profile.get("s") == "ok":
+            data = profile.get("data", {})
+            return {
+                "name": data.get("name"),
+                "client_id": data.get("fy_id"),
+                "email": data.get("email_id")
+            }
+        return {}
+
+    def _normalize_date(self, date_str: str) -> str:
+        """Converts various date formats (DD/MM/YY, DD-MM-YYYY) to YYYY-MM-DD."""
+        for fmt in ("%Y-%m-%d", "%d/%m/%y", "%d/%m/%Y", "%d-%m-%Y"):
+            try:
+                return datetime.strptime(date_str, fmt).strftime("%Y-%m-%d")
+            except ValueError:
+                continue
+        return date_str # Fallback
+
+    async def fetch_history(self, symbol: str, interval: str, start: str, end: str) -> List[Dict[str, Any]]:
+        """Standardizes Fyers history response with support for 100-day chunking."""
+        await self.rate_limiter.consume()
+        
+        fyers_symbol = symbol
+        if fyers_symbol.startswith("NSE:") and "-" not in fyers_symbol:
+            fyers_symbol = f"{fyers_symbol}-EQ"
+            
+        start_date = datetime.strptime(self._normalize_date(start), "%Y-%m-%d")
+        end_date = datetime.strptime(self._normalize_date(end), "%Y-%m-%d")
+        
+        # Fyers limit: 100 days for 1-minute data
+        MAX_DAYS = 99 # Using slightly less for safety
+        
+        all_candles = []
+        current_start = start_date
+        
+        while current_start <= end_date:
+            current_end = min(current_start + timedelta(days=MAX_DAYS), end_date)
+            
+            data = {
+                "symbol": fyers_symbol,
+                "resolution": interval,
+                "date_format": "1", # yyyy-mm-dd
+                "range_from": current_start.strftime("%Y-%m-%d"),
+                "range_to": current_end.strftime("%Y-%m-%d"),
+                "cont_flag": "1"
+            }
+            
+            res = await asyncio.to_thread(self.api.history, data=data)
+            
+            if res.get("s") == "ok":
+                candles = res.get("candles", [])
+                all_candles.extend(candles)
+            else:
+                logging.error(f"Fyers History Chunk Error [{current_start} - {current_end}]: {res}")
+                # If one chunk fails, we return what we have so far
+                break
+                
+            current_start = current_end + timedelta(days=1)
+            # Sleep slightly between chunks to stay within rate limits for long fetches
+            await asyncio.sleep(0.1)
+            
+        # Convert [[ts, o, h, l, c, v], ...] to list of dicts
+        return [
+            {
+                "timestamp": c[0],
+                "open": c[1],
+                "high": c[2],
+                "low": c[3],
+                "close": c[4],
+                "volume": c[5]
+            } for c in all_candles
+        ]
+
+    async def start_ticker(self, symbols: List[str], on_tick: callable):
+        self.on_tick_callback = on_tick
+        access_token_full = f"{self.client_id}:{self.access_token}"
+        
+        self.symbols_to_subscribe = []
+        self._reverse_symbol_map = {}
+        for sym in symbols:
+            fyers_sym = sym
+            if sym.startswith("NSE:") and "-" not in sym:
+                fyers_sym = f"{sym}-EQ"
+            self.symbols_to_subscribe.append(fyers_sym)
+            self._reverse_symbol_map[fyers_sym] = sym
+        
+        self.ws = data_ws.FyersDataSocket(
+            access_token=access_token_full,
+            log_path=self.log_path,
+            litemode=False,
+            reconnect=True,
+            on_connect=self._on_connect,
+            on_message=self._on_message,
+            on_error=self._on_error,
+            on_close=self._on_close
+        )
+        # WS connect is blocking, run in thread
+        import threading
+        t = threading.Thread(target=self.ws.connect, daemon=True)
+        t.start()
+
+    def _on_connect(self):
+        logging.info("Fyers Adapter connected to WS")
+        if self.symbols_to_subscribe:
+            self.ws.subscribe(symbol=self.symbols_to_subscribe, data_type="SymbolUpdate")
+
+    def _on_message(self, message):
+        if self.on_tick_callback:
+            if isinstance(message, dict) and 'symbol' in message:
+                fyers_sym = message['symbol']
+                app_sym = getattr(self, '_reverse_symbol_map', {}).get(fyers_sym, fyers_sym)
+                
+                self._last_tick_times[app_sym] = datetime.now()
+                tick = {
+                    "symbol": app_sym,
+                    "ltp": message.get('ltp'),
+                    "volume": message.get('vol_traded_today', 0),
+                    "timestamp": message.get('timestamp')
+                }
+                # Use threadsafe for callback if needed
+                # Handle async callback from sync SDK thread
+                loop = asyncio.get_event_loop()
+                asyncio.run_coroutine_threadsafe(self.on_tick_callback(tick), loop)
+
+    async def stop_ticker(self):
+        if self.ws:
+            await asyncio.to_thread(self.ws.close)
+
+    def is_connected(self) -> bool:
+        return self.access_token is not None
