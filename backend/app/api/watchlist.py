@@ -6,7 +6,21 @@ from sqlalchemy import select, delete, distinct
 from typing import List, Dict, Any
 import logging
 
+from pydantic import BaseModel
+
 router = APIRouter(prefix="/api/watchlist", tags=["watchlist"])
+
+class WatchlistAddRequest(BaseModel):
+    symbol: str
+    name: str = "Default"
+
+class WatchlistBulkRequest(BaseModel):
+    text: str
+    name: str = "Default"
+
+class WatchlistRemoveRequest(BaseModel):
+    symbol: str
+    name: str = "Default"
 
 @router.get("/names")
 async def list_watchlist_names(db: AsyncSession = Depends(get_async_db)):
@@ -23,39 +37,39 @@ async def list_watchlist(name: str = "Default", db: AsyncSession = Depends(get_a
     return [i.symbol for i in items]
 
 @router.post("/add")
-async def add_to_watchlist(symbol: str, name: str = "Default", db: AsyncSession = Depends(get_async_db)):
+async def add_to_watchlist(data: WatchlistAddRequest, db: AsyncSession = Depends(get_async_db)):
     """Adds a symbol to the watchlist."""
-    symbols = [s.strip().upper() for s in symbol.replace(",", " ").split() if s.strip()]
+    symbols = [s.strip().upper() for s in data.symbol.replace(",", " ").split() if s.strip()]
     added = []
     for s in symbols:
         val = s if ":" in s else f"NSE:{s}"
-        check = await db.execute(select(WatchlistMember).filter(WatchlistMember.list_name == name, WatchlistMember.symbol == val))
+        check = await db.execute(select(WatchlistMember).filter(WatchlistMember.list_name == data.name, WatchlistMember.symbol == val))
         if not check.scalar_one_or_none():
-            member = WatchlistMember(list_name=name, symbol=val)
+            member = WatchlistMember(list_name=data.name, symbol=val)
             db.add(member)
             added.append(val)
     await db.commit()
     return {"status": "success", "added": added}
 
 @router.post("/bulk")
-async def bulk_upload(text: str, name: str = "Default", db: AsyncSession = Depends(get_async_db)):
+async def bulk_upload(data: WatchlistBulkRequest, db: AsyncSession = Depends(get_async_db)):
     """Bulk adds symbols to the watchlist from string."""
-    symbols = [s.strip().upper() for s in text.replace(",", " ").split() if s.strip()]
+    symbols = [s.strip().upper() for s in data.text.replace(",", " ").split() if s.strip()]
     added = []
     for s in symbols:
         val = s if ":" in s else f"NSE:{s}"
-        check = await db.execute(select(WatchlistMember).filter(WatchlistMember.list_name == name, WatchlistMember.symbol == val))
+        check = await db.execute(select(WatchlistMember).filter(WatchlistMember.list_name == data.name, WatchlistMember.symbol == val))
         if not check.scalar_one_or_none():
-            member = WatchlistMember(list_name=name, symbol=val)
+            member = WatchlistMember(list_name=data.name, symbol=val)
             db.add(member)
             added.append(val)
     await db.commit()
     return {"status": "success", "count": len(added)}
 
 @router.post("/remove")
-async def remove_from_watchlist(symbol: str, name: str = "Default", db: AsyncSession = Depends(get_async_db)):
+async def remove_from_watchlist(data: WatchlistRemoveRequest, db: AsyncSession = Depends(get_async_db)):
     """Removes a symbol from the watchlist."""
-    await db.execute(delete(WatchlistMember).filter(WatchlistMember.list_name == name, WatchlistMember.symbol == symbol.upper()))
+    await db.execute(delete(WatchlistMember).filter(WatchlistMember.list_name == data.name, WatchlistMember.symbol == data.symbol.upper()))
     await db.commit()
     return {"status": "success"}
 
