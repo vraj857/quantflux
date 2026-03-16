@@ -1,8 +1,9 @@
 import React, { useState, useEffect } from 'react';
-import { Loader2, AlertCircle, Layers, TrendingUp } from 'lucide-react';
+import { Loader2, AlertCircle, Layers, TrendingUp, BarChart2, Grid } from 'lucide-react';
 import { clsx } from 'clsx';
 import { api } from '../services/api';
 import BacktestGrid from './BacktestGrid';
+import PhaseAnalyticsDashboard from './PhaseAnalyticsDashboard';
 
 const BacktestView = ({ theme }) => {
     // Mode toggle: 'watchlist' | 'single'
@@ -18,6 +19,8 @@ const BacktestView = ({ theme }) => {
     const [endDate, setEndDate] = useState(new Date().toISOString().split('T')[0]);
     const [timeframe, setTimeframe] = useState(25);
     const [gridData, setGridData] = useState(null);
+    const [phaseStatsList, setPhaseStatsList] = useState([]);
+    const [resultsTab, setResultsTab] = useState('grid');
     const [loading, setLoading] = useState(false);
     const [error, setError] = useState(null);
     const [progress, setProgress] = useState('');
@@ -59,6 +62,8 @@ const BacktestView = ({ theme }) => {
         setLoading(true);
         setError(null);
         setGridData(null);
+        setPhaseStatsList([]);
+        setResultsTab('grid');
         setProgress('');
 
         try {
@@ -68,6 +73,7 @@ const BacktestView = ({ theme }) => {
                 const data = await fetchSingle(selectedSymbol);
                 if (data.s === 'ok' && data.grid_data) {
                     setGridData(data.grid_data);
+                    if (data.phase_stats) setPhaseStatsList([data.phase_stats]);
                 } else {
                     setError(data.message || 'No data found for this date range/symbol.');
                 }
@@ -79,6 +85,7 @@ const BacktestView = ({ theme }) => {
                 if (symbols.length === 0) { setError('Selected watchlist has no symbols.'); return; }
                 
                 const merged = { data: {}, slot_labels: [] };
+                const allPhaseStats = [];
                 let successCount = 0;
 
                 for (let i = 0; i < symbols.length; i++) {
@@ -96,10 +103,13 @@ const BacktestView = ({ theme }) => {
                             if (gd.data) {
                                 Object.assign(merged.data, gd.data);
                             }
+                            // Collect phase stats per symbol
+                            if (resp.phase_stats) allPhaseStats.push(resp.phase_stats);
                             successCount++;
                         }
                     } catch (e) { /* skip failed symbols */ }
                 }
+                setPhaseStatsList(allPhaseStats);
 
                 setProgress('');
                 if (Object.keys(merged.data).length > 0) {
@@ -260,17 +270,63 @@ const BacktestView = ({ theme }) => {
 
             {gridData && (
                 <div className="flex flex-col flex-1 min-h-0">
-                    <h3 className={clsx('text-sm font-black mb-3 tracking-widest uppercase ml-1', theme === 'dark' ? 'text-gray-400' : 'text-gray-600')}>
-                        Statistical Breakdown
-                        {mode === 'watchlist' && (
-                            <span className="ml-3 text-indigo-400 normal-case font-bold text-[10px]">
-                                — {activeCollection} ({Object.keys(gridData.data).length} symbols)
-                            </span>
-                        )}
-                    </h3>
-                    <div className="flex flex-col flex-1 min-h-0">
-                        <BacktestGrid data={gridData} theme={theme} />
+                    {/* Results Tab Switcher */}
+                    <div className="flex items-center justify-between mb-4 shrink-0">
+                        <h3 className={clsx('text-sm font-black tracking-widest uppercase ml-1', theme === 'dark' ? 'text-gray-400' : 'text-gray-600')}>
+                            Results
+                            {mode === 'watchlist' && (
+                                <span className="ml-3 text-indigo-400 normal-case font-bold text-[10px]">
+                                    — {activeCollection} ({Object.keys(gridData.data).length} symbols)
+                                </span>
+                            )}
+                        </h3>
+                        <div className={clsx('flex p-1 rounded-xl border', theme === 'dark' ? 'bg-black/20 border-white/5' : 'bg-gray-100 border-gray-200')}>
+                            <button
+                                onClick={() => setResultsTab('grid')}
+                                className={clsx(
+                                    'flex items-center space-x-1.5 px-4 py-1.5 rounded-lg text-[10px] font-black uppercase tracking-widest transition-all',
+                                    resultsTab === 'grid'
+                                        ? 'bg-indigo-600 text-white shadow-md'
+                                        : theme === 'dark' ? 'text-gray-400 hover:text-white' : 'text-gray-500 hover:text-gray-800'
+                                )}
+                            >
+                                <Grid size={11} />
+                                <span>Data Grid</span>
+                            </button>
+                            <button
+                                onClick={() => setResultsTab('phase')}
+                                disabled={phaseStatsList.length === 0}
+                                className={clsx(
+                                    'flex items-center space-x-1.5 px-4 py-1.5 rounded-lg text-[10px] font-black uppercase tracking-widest transition-all',
+                                    resultsTab === 'phase'
+                                        ? 'bg-indigo-600 text-white shadow-md'
+                                        : theme === 'dark' ? 'text-gray-400 hover:text-white' : 'text-gray-500 hover:text-gray-800',
+                                    phaseStatsList.length === 0 && 'opacity-40 cursor-not-allowed'
+                                )}
+                            >
+                                <BarChart2 size={11} />
+                                <span>Phase Analysis</span>
+                            </button>
+                        </div>
                     </div>
+
+                    {/* Grid View */}
+                    {resultsTab === 'grid' && (
+                        <div className="flex flex-col flex-1 min-h-0">
+                            <BacktestGrid data={gridData} theme={theme} />
+                        </div>
+                    )}
+
+                    {/* Phase Analytics View */}
+                    {resultsTab === 'phase' && (
+                        <div className="flex-1 overflow-auto p-2">
+                            <PhaseAnalyticsDashboard
+                                phaseStats={phaseStatsList}
+                                watchlistName={mode === 'watchlist' ? activeCollection : selectedSymbol}
+                                theme={theme}
+                            />
+                        </div>
+                    )}
                 </div>
             )}
         </div>
