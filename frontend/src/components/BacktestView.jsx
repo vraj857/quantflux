@@ -264,7 +264,7 @@ const BacktestView = ({ theme }) => {
                         Statistical Breakdown
                         {mode === 'watchlist' && (
                             <span className="ml-3 text-indigo-400 normal-case font-bold text-[10px]">
-                                — {activeCollection} ({Object.keys(gridData).length} symbols)
+                                — {activeCollection} ({Object.keys(gridData.data).length} symbols)
                             </span>
                         )}
                     </h3>
