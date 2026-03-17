@@ -109,3 +109,10 @@ class ZerodhaAdapter(IBroker):
 
     def is_connected(self) -> bool:
         return self.access_token is not None
+
+    async def validate_token(self) -> bool:
+        try:
+            profile = await self.get_profile()
+            return bool(profile and profile.get("client_id"))
+        except Exception:
+            return False

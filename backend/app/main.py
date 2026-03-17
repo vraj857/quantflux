@@ -8,8 +8,9 @@ from app.models.session import BrokerSession
 from app.broker_management.fyers import FyersAdapter
 from app.broker_management.zerodha import ZerodhaAdapter
 from app.core.resilience import ResilienceManager
-from config import FYERS_APP_ID, FYERS_SECRET_KEY, FYERS_REDIRECT_URL, KITE_API_KEY, KITE_API_SECRET
-from sqlalchemy import select
+from app.services.broker_state import state_store, market_pubsub
+from app.core.audit import audit_log
+from app.workers.reauth import start_reauth_worker, fyers_breaker, zerodha_breaker
 import json
 import asyncio
 from datetime import datetime
@@ -29,7 +30,24 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# Active WebSocket connections
+@app.middleware("http")
+async def audit_middleware(request, call_next):
+    """Action-aware Audit Middleware for Enterprise Compliance."""
+    start_time = datetime.utcnow()
+    response = await call_next(request)
+    
+    # Simple heuristic to identify actions for the audit trail
+    if request.method in ["POST", "PUT", "DELETE"]:
+        duration = (datetime.utcnow() - start_time).total_seconds()
+        audit_log.log_event(
+            action=f"API_{request.method}",
+            ip_address=request.client.host,
+            status=str(response.status_code),
+            message=f"Request to {request.url.path} handled in {duration}s"
+        )
+    return response
+
+# Active local WebSocket connections (for this node)
 active_connections = set()
 
 # Include Routers
@@ -46,35 +64,46 @@ async def broadcast_payload(payload: dict):
     await asyncio.gather(*tasks, return_exceptions=True)
 
 async def on_tick_received(tick: dict):
-    """Callback from broker adapters when a new tick arrives."""
+    """
+    Callback from broker adapters when a new tick arrives.
+    Distributes events via Redis Pub/Sub for stateless scaling.
+    """
     symbol = str(tick['symbol'])
-    # Standardize: tick must have 'open', 'high', 'low', 'close', 'volume', 'timestamp'
-    candle_1m = {
-        "timestamp": tick.get('timestamp') or datetime.now(),
-        "open": tick['ltp'],
-        "high": tick['ltp'],
-        "low": tick['ltp'],
-        "close": tick['ltp'],
-        "volume": tick.get('volume', 0)
+    
+    # Standardize tick for Pub/Sub distribution
+    data = {
+        "timestamp": tick.get('timestamp') or datetime.utcnow().isoformat(),
+        "ltp": tick['ltp'],
+        "symbol": symbol
     }
     
-    # Process through aggregator
-    slot = await state.aggregator.process_candle(symbol, candle_1m)
+    # 1. Publish to Redis (Enterprise Scaling)
+    await market_pubsub.publish_tick(symbol, data)
+    
+    # 2. Local Node Processing (Optional: can be handled by a dedicated Aggregator Worker)
+    slot = await state.aggregator.process_candle(symbol, {
+        "timestamp": data["timestamp"],
+        "open": data["ltp"], "high": data["ltp"], "low": data["ltp"], "close": data["ltp"],
+        "volume": tick.get('volume', 0)
+    })
+    
     if slot:
-        # If a slot was updated or completed, fetch full UI payload and broadcast
         payload = state.aggregator.get_full_market_state()
-        await broadcast_payload({
-            "type": "MARKET_UPDATE",
-            "data": payload
-        })
+        await broadcast_payload({"type": "MARKET_UPDATE", "data": payload})
 
 @app.on_event("startup")
 async def startup_event():
     # 1. Initialize Database Tables
-    async with engine.begin() as conn:
-        await conn.run_sync(Base.metadata.create_all)
+    from app.database import init_async_db
+    await init_async_db()
     
-    # 2. Session Auto-Resumption
+    # 2. Load DNA Profiles into Memory
+    async with AsyncSessionLocal() as db:
+        from app.core.profiles import ProfileManager
+        state.phase_dnas = await ProfileManager.get_all_active_dnas(db)
+        logging.info(f"Loaded {len(state.phase_dnas)} Phase DNA profiles.")
+
+    # 3. Session Auto-Resumption
     async with AsyncSessionLocal() as db:
         result = await db.execute(
             select(BrokerSession).filter(BrokerSession.is_active == 1).order_by(BrokerSession.created_at.desc()).limit(1)
@@ -83,27 +112,29 @@ async def startup_event():
         
         if last_session:
             try:
+                adapter = None
                 if last_session.broker == "FYERS":
                     adapter = FyersAdapter(FYERS_APP_ID, FYERS_SECRET_KEY, FYERS_REDIRECT_URL)
                     adapter.access_token = last_session.access_token
                     from fyers_apiv3 import fyersModel
                     adapter.api = fyersModel.FyersModel(client_id=adapter.client_id, token=adapter.access_token, is_async=False, log_path="")
-                    state.active_broker = adapter
-                    state.active_broker_name = "FYERS"
                 elif last_session.broker == "ZERODHA":
                     adapter = ZerodhaAdapter(KITE_API_KEY, KITE_API_SECRET)
                     adapter.access_token = last_session.access_token
                     from kiteconnect import KiteConnect
                     adapter.api = KiteConnect(api_key=KITE_API_KEY)
                     adapter.api.set_access_token(adapter.access_token)
+
+                from app.api.auth import validate_and_cleanup_session
+                if adapter and await validate_and_cleanup_session(adapter, last_session.id, db):
                     state.active_broker = adapter
-                    state.active_broker_name = "ZERODHA"
-                
-                # Start the ticker if symbols are available
-                # (Symbols fetch logic would go here)
-                
-            except Exception as e:
-                logging.error(f"Failed to auto-resume session: {e}")
+                    state.active_broker_name = last_session.broker
+                    logging.info(f"Auto-resumed valid {last_session.broker} session.")
+                    
+    # 4. Proactive Security Worker (Enterprise Self-Healing)
+    start_reauth_worker()
+    
+    audit_log.log_event("SERVICE_STARTUP", message="QuantFlux Enterprise API Node Initialized")
 
 @app.websocket("/ws")
 async def websocket_endpoint(websocket: WebSocket):

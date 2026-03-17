@@ -3,9 +3,11 @@ import Sidebar from './components/Sidebar';
 import LiveFeedGrid from './components/LiveFeedGrid';
 import BacktestView from './components/BacktestView';
 import SettingsView from './components/SettingsView';
+import PhaseSimulatorView from './components/PhaseSimulatorView';
+import OrderConsole from './components/OrderConsole';
 import BrokerLoginGate from './components/BrokerLoginGate';
 import { useMarketData } from './hooks/useMarketData';
-import { Monitor, History, LayoutDashboard, Zap, ShieldCheck, Settings as SettingsIcon } from 'lucide-react';
+import { Monitor, History, LayoutDashboard, Zap, ShieldCheck, Settings as SettingsIcon, Play, Target } from 'lucide-react';
 
 import { clsx } from 'clsx';
 import { api } from './services/api';
@@ -65,21 +67,19 @@ const App = () => {
 
         const checkSession = async () => {
             try {
-                // Use localhost explicitly instead of 127.0.0.1 for consistency
-                const res = await fetch('http://127.0.0.1:8000/api/auth/status');
-                const data = await res.json();
+                const data = await api.checkSessionStatus();
                 if (data.authenticated && data.broker) {
                     const newSession = { broker: data.broker, authenticatedAt: new Date().toISOString() };
                     sessionStorage.setItem('BROKER_SESSION', JSON.stringify(newSession));
                     setSession(newSession);
                 } else {
-                    // Force clear if backend says no session
-                    sessionStorage.removeItem('BROKER_SESSION');
-                    setSession(null);
-                    setBrokerProfile(null);
+                    console.warn('Session check reports unauthenticated. Forcing gate.');
+                    handleLogout(); // Use shared logout logic for consistency
                 }
             } catch (e) {
-                console.log('Backend not reachable for session check');
+                console.error('Core session check failed:', e);
+                // Hard reset on failure to ensure user isn't stuck on a dead dashboard
+                handleLogout();
             }
         };
 
@@ -359,6 +359,8 @@ const App = () => {
                 <div className={clsx("flex-1 overflow-auto", activeView === 'backtest' ? "flex flex-col" : "hidden")}>
                     <BacktestView theme={theme} />
                 </div>
+                {activeView === 'simulator' && <PhaseSimulatorView theme={theme} />}
+                {activeView === 'orders' && <OrderConsole theme={theme} />}
                 {activeView === 'settings' && <SettingsView theme={theme} onAuthSuccess={handleAuthSuccess} />}
 
                 {activeView === 'analytics' && (

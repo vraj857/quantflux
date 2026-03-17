@@ -4,13 +4,26 @@ import { Zap, AlertCircle } from 'lucide-react';
 import { TIME_SLOTS_25, PHASES_25, METRIC_CONFIG } from '../constants';
 
 const MetricRow = ({ symbol, metric, data, isFirst, theme, slotCount, dailySummary }) => {
+    const numMetrics = METRIC_CONFIG.length;
+    const isPrice = metric === "Price";
+    
+    let dayHigh = null;
+    let dayLow = null;
+    if (isPrice) {
+        const prices = (data.price || []).filter(p => p != null && p !== undefined);
+        if (prices.length > 0) {
+            dayHigh = Math.max(...prices);
+            dayLow = Math.min(...prices);
+        }
+    }
+
     return (
         <tr className={clsx(
             "border-b transition-colors",
             theme === 'dark' ? "border-white/5 group hover:bg-white/[0.02]" : "border-gray-100 hover:bg-gray-50/50"
         )}>
             {isFirst && (
-                <td rowSpan={4} className={clsx(
+                <td rowSpan={numMetrics} className={clsx(
                     "p-3 px-4 align-middle border-r min-w-[200px]",
                     theme === 'dark' ? "border-white/10 bg-black/40" : "border-gray-200 bg-gray-50"
                 )}>
@@ -29,7 +42,7 @@ const MetricRow = ({ symbol, metric, data, isFirst, theme, slotCount, dailySumma
                         </div>
 
                         {/* Daily Stats (Inline) */}
-                        <div className={clsx("flex flex-col border-l pl-3", theme === 'dark' ? "border-white/10" : "border-gray-200")}>
+                        <div className={clsx("flex flex-col border-l pl-3 shrink-0", theme === 'dark' ? "border-white/10" : "border-gray-200")}>
                             <div className="flex items-baseline space-x-1.5 leading-none mb-1">
                                 <span className={clsx("text-xs font-black", theme === 'dark' ? "text-white" : "text-gray-900")}>
                                     ₹{dailySummary?.current_price?.toLocaleString('en-IN')}
@@ -38,13 +51,35 @@ const MetricRow = ({ symbol, metric, data, isFirst, theme, slotCount, dailySumma
                                     "text-[9px] font-bold",
                                     dailySummary?.percent_change > 0 ? "text-emerald-500" : "text-rose-500"
                                 )}>
-                                    {dailySummary?.percent_change > 0 ? '▲' : '▼'}{Math.abs(dailySummary?.percent_change)}%
+                                    {dailySummary?.percent_change > 0 ? '▲' : '▼'}{Math.abs(dailySummary?.percent_change || 0).toFixed(2)}%
                                 </span>
                             </div>
-                            <span className="text-[8px] font-black text-gray-500 uppercase tracking-tighter">
-                                VOL: {dailySummary?.total_volume?.toLocaleString('en-IN')}
-                            </span>
+                            <div className="flex items-center space-x-2">
+                                <span className="text-[8px] font-black text-gray-500 uppercase tracking-tighter">
+                                    VOL: {dailySummary?.total_volume?.toLocaleString('en-IN')}
+                                </span>
+                                <span className={clsx("text-[8px] font-black uppercase tracking-tighter", dailySummary?.price_move > 0 ? "text-emerald-500" : "text-rose-500")}>
+                                    INR: {dailySummary?.price_move > 0 ? '+' : ''}{dailySummary?.price_move?.toFixed(2)}
+                                </span>
+                            </div>
                         </div>
+
+                        {/* Phase Health Alerts */}
+                        {data.phase_alerts && data.phase_alerts.length > 0 && (
+                            <div className="flex flex-col space-y-1 pl-3 border-l border-white/5 ml-auto overflow-hidden">
+                                {data.phase_alerts.slice(0, 2).map((alert, idx) => (
+                                    <div key={idx} className={clsx(
+                                        "px-2 py-0.5 rounded text-[8px] font-black uppercase tracking-tighter flex items-center space-x-1 animate-in fade-in slide-in-from-right-2",
+                                        alert.type === 'SIGNAL' ? "bg-emerald-500/20 text-emerald-400 border border-emerald-500/30" :
+                                        alert.type === 'RISK' ? "bg-rose-500/20 text-rose-400 border border-rose-500/30" :
+                                        "bg-gray-500/10 text-gray-400 border border-white/5"
+                                    )}>
+                                        <Zap size={10} className={clsx(alert.type === 'SIGNAL' && "fill-current animate-pulse")} />
+                                        <span className="truncate max-w-[100px]">{alert.msg}</span>
+                                    </div>
+                                ))}
+                            </div>
+                        )}
                     </div>
                 </td>
             )}
@@ -58,24 +93,46 @@ const MetricRow = ({ symbol, metric, data, isFirst, theme, slotCount, dailySumma
                 const metricEntry = METRIC_CONFIG.find(m => m.label === metric);
                 const dataKey = metricEntry ? metricEntry.key : 'price';
                 const val = data[dataKey]?.[i];
+                
+                const pcVal = data.percent_change?.[i];
+                const vsVal = data.volume_strength?.[i];
+
                 const isPrice = metric === "Price";
+                const isINR = metric === "INR";
                 const isPC = metric === "PC %";
                 const isVS = metric === "VS %";
+
+                let sentimentBg = theme === 'dark' ? "bg-zinc-900/40" : "bg-gray-100/60";
+                if (vsVal !== undefined && pcVal !== undefined) {
+                    if (vsVal > 120) {
+                        if (pcVal > 0) sentimentBg = theme === 'dark' ? "bg-emerald-500/20" : "bg-emerald-100";
+                        else if (pcVal < 0) sentimentBg = theme === 'dark' ? "bg-rose-500/20" : "bg-rose-100";
+                    } else if (vsVal < 70) {
+                        if (pcVal > 0) sentimentBg = theme === 'dark' ? "bg-emerald-500/10" : "bg-emerald-50";
+                        else if (pcVal < 0) sentimentBg = theme === 'dark' ? "bg-rose-500/10" : "bg-rose-50";
+                    }
+                }
 
                 return (
                     <td key={i} className={clsx(
                         "p-2 text-center text-xs font-mono font-bold transition-all border",
                         isPC && val > 0 && "text-emerald-500",
                         isPC && val < 0 && "text-rose-500",
+                        isINR && val > 0 && (theme === 'dark' ? "text-emerald-400" : "text-emerald-600"),
+                        isINR && val < 0 && (theme === 'dark' ? "text-rose-400" : "text-rose-600"),
                         isVS && val > 150 && (theme === 'dark' ? "bg-amber-500/10 text-amber-500" : "bg-amber-50 text-amber-600"),
                         isVS && val < 50 && "text-gray-600 opacity-50",
-                        theme === 'dark' ? "border-white/10 bg-zinc-900/40" : "border-gray-300 bg-gray-100/60"
+                        sentimentBg,
+                        isPrice && val !== undefined && val === dayHigh && "ring-2 ring-blue-500 ring-inset z-10",
+                        isPrice && val !== undefined && val === dayLow && "ring-2 ring-rose-700 ring-inset z-10",
+                        theme === 'dark' ? "border-white/10" : "border-gray-200"
                     )}>
                         {val !== undefined && val !== null ? (
                             isPC ? `${val > 0 ? '+' : ''}${val}%` :
                                 isVS ? `${val}%` :
                                     isPrice ? val.toLocaleString('en-IN') :
-                                        val.toLocaleString('en-IN')
+                                        isINR ? `${val > 0 ? '+' : ''}${val.toFixed(2)}` :
+                                            val.toLocaleString('en-IN')
                         ) : '-'}
                     </td>
                 );

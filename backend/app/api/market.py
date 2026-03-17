@@ -43,142 +43,274 @@ async def set_timeframe(data: TimeframeUpdate):
 
 @router.get("/historical-ohlc")
 async def get_historical_ohlc(symbol: str, start_date: str, end_date: str, timeframe: int = 25):
-    """Fetches historical OHLC for charting and grid visualization."""
+    """Fetches historical OHLC with local caching and deep scaling."""
     if not state.active_broker:
         raise HTTPException(status_code=400, detail="No active broker session")
     
-    try:
-        from datetime import timedelta
-        # Standardize interval to '1' (minute) for raw candle fetch
-        interval = "1" if state.active_broker_name == "FYERS" else "minute"
-        raw_candles = await state.active_broker.fetch_history(symbol, interval, start_date, end_date)
+    from app.core.history_cache import HistoryCache
+    cache = HistoryCache()
+    interval = "1" if state.active_broker_name == "FYERS" else "minute"
+    
+    start_dt = datetime.strptime(start_date, "%Y-%m-%d")
+    end_dt = datetime.strptime(end_date, "%Y-%m-%d").replace(hour=23, minute=59, second=59)
+    
+    # Cap end_dt at now to avoid gaps for the future part of today
+    now = datetime.now()
+    if end_dt > now:
+        end_dt = now
+    
+    # 1. Identify missing ranges
+    missing_ranges = cache.get_missing_ranges(symbol, interval, start_dt, end_dt)
+    
+    # 2. Fetch missing chunks from broker
+    for chunk_start, chunk_end in missing_ranges:
+        try:
+            # Note: For very long ranges, we would further chunk this into 60-day blocks
+            # if the broker adaptor doesn't already handle it.
+            new_candles = await state.active_broker.fetch_history(
+                symbol, interval, 
+                chunk_start.strftime("%Y-%m-%d"), 
+                chunk_end.strftime("%Y-%m-%d")
+            )
+            cache.save_candles(symbol, interval, new_candles)
+        except Exception as e:
+            logging.error(f"Deep fetch chunk error: {e}")
+            
+    # 3. Pull final combined list from Cache
+    raw_candles = cache.get_candles(symbol, interval, int(start_dt.timestamp()), int(end_dt.timestamp()))
+    
+    if not raw_candles:
+        return {"s": "error", "message": "No data found for this range."}
+
+    aggregated_slots = []
+    current_slot = None
+    
+    from datetime import timedelta
+    for c in raw_candles:
+        # DB stores integer timestamps
+        dt = datetime.fromtimestamp(c["timestamp"])
+            
+        m_start = dt.replace(hour=9, minute=15, second=0, microsecond=0)
+        if dt < m_start: continue
         
-        aggregated_slots = []
-        current_slot = None
+        diff_minutes = (dt - m_start).total_seconds() / 60
+        slot_idx = int(diff_minutes // timeframe)
+        slot_start_time = m_start + timedelta(minutes=slot_idx * timeframe)
+        label = slot_start_time.strftime("%d %b %H:%M")
         
-        for c in raw_candles:
-            ts = c.get('timestamp') or c.get('date')
-            if isinstance(ts, datetime):
-                dt = ts
-            elif isinstance(ts, str):
-                try: dt = datetime.fromisoformat(ts.replace('Z', '+00:00'))
-                except: dt = datetime.fromtimestamp(int(ts))
-            else:
-                dt = datetime.fromtimestamp(int(ts))
-                
-            m_start = dt.replace(hour=9, minute=15, second=0, microsecond=0)
-            if dt < m_start: continue
+        if not current_slot or current_slot["label"] != label:
+            if current_slot: aggregated_slots.append(current_slot)
+            current_slot = {
+                "label": label,
+                "epoch": int(slot_start_time.timestamp()),
+                "open": c["open"],
+                "high": c["high"],
+                "low": c["low"],
+                "close": c["close"],
+                "volume": c["volume"]
+            }
+        else:
+            current_slot["high"] = max(current_slot["high"], c["high"])
+            current_slot["low"] = min(current_slot["low"], c["low"])
+            current_slot["close"] = c["close"]
+            current_slot["volume"] += c["volume"]
             
-            diff_minutes = (dt - m_start).total_seconds() / 60
-            slot_idx = int(diff_minutes // timeframe)
-            slot_start_time = m_start + timedelta(minutes=slot_idx * timeframe)
-            label = slot_start_time.strftime("%d %b %H:%M")
-            
-            if not current_slot or current_slot["label"] != label:
-                if current_slot: aggregated_slots.append(current_slot)
-                current_slot = {
-                    "label": label,
-                    "epoch": int(slot_start_time.timestamp()),
-                    "open": c.get('open', 0),
-                    "high": c.get('high', 0),
-                    "low": c.get('low', 0),
-                    "close": c.get('close', 0),
-                    "volume": c.get('volume', 0)
-                }
-            else:
-                current_slot["high"] = max(current_slot["high"], c.get('high', 0))
-                current_slot["low"] = min(current_slot["low"], c.get('low', 0))
-                current_slot["close"] = c.get('close', 0)
-                current_slot["volume"] += c.get('volume', 0)
-                
-        if current_slot: aggregated_slots.append(current_slot)
+    if current_slot: aggregated_slots.append(current_slot)
+    
+    plotly_candles, prices, pcs, inr_moves, vols, vss, labels = [], [], [], [], [], [], []
+    for idx, s in enumerate(aggregated_slots):
+        plotly_candles.append([s["epoch"], s["open"], s["high"], s["low"], s["close"], s["volume"]])
+        labels.append(s["label"])
+        prices.append(s["close"])
+        vols.append(s["volume"])
         
-        plotly_candles, prices, pcs, vols, vss, labels = [], [], [], [], [], []
-        for idx, s in enumerate(aggregated_slots):
-            plotly_candles.append([s["epoch"], s["open"], s["high"], s["low"], s["close"], s["volume"]])
-            labels.append(s["label"])
-            prices.append(s["close"])
-            vols.append(s["volume"])
-            
-            pc = round(((s["close"] - s["open"]) / s["open"]) * 100, 2) if s["open"] > 0 else 0.0
-            pcs.append(pc)
-            
+        inr_move = round(s["close"] - s["open"], 2)
+        inr_moves.append(inr_move)
+        
+        pc = round((inr_move / s["open"]) * 100, 2) if s["open"] > 0 else 0.0
+        pcs.append(pc)
+        
+        slot_dt = datetime.fromtimestamp(s["epoch"])
+        if slot_dt.hour == 9 and slot_dt.minute == 15:
+            vs = 100.0
+        else:
             # Trailing avg for volume strength
             past_vols = [h["volume"] for h in aggregated_slots[:idx]]
             avg = sum(past_vols[-20:])/len(past_vols[-20:]) if past_vols else s["volume"]
             vs = round((s["volume"] / avg) * 100, 2) if avg > 0 else 100.0
-            vss.append(vs)
+        vss.append(vs)
 
-        # ── Phase Boundary Classification ──
-        # Phase boundaries in minutes from 9:15 for 25-min slots:
-        # Morning (9:15–10:05): slot_idx 0,1,2
-        # Midday (10:30–12:10): slot_idx 3,4,5,6,7
-        # Trend (12:35–14:15): slot_idx 8,9,10,11
-        # Closing (14:40–15:05): slot_idx 12,13,14
-        PHASE_BOUNDS = [
-            {"name": "Morning Phase",    "label": "Morning (9:15–10:30)",      "slots": list(range(0, 3))},
-            {"name": "Midday Chop",      "label": "Midday Chop (10:30–12:35)", "slots": list(range(3, 8))},
-            {"name": "Trend Formation",  "label": "Trend Formation (12:35–14:15)", "slots": list(range(8, 12))},
-            {"name": "Closing Session",  "label": "Closing Session (14:15–15:30)","slots": list(range(12, 15))},
-        ]
-
-        def safe_avg(lst):
-            return round(sum(lst) / len(lst), 2) if lst else 0.0
-
-        def phase_yield(slot_list):
-            """Discrete % change from first open to last close in a phase."""
-            opens = [aggregated_slots[i]["open"] for i in slot_list if i < len(aggregated_slots)]
-            closes = [aggregated_slots[i]["close"] for i in slot_list if i < len(aggregated_slots)]
-            if not opens or not closes or opens[0] == 0:
-                return 0.0
-            return round(((closes[-1] - opens[0]) / opens[0]) * 100, 2)
-
-        phase_stats = {}
-        total_vol = sum(vols) or 1  # avoid div/0
-        for phase in PHASE_BOUNDS:
-            idx_list = [i for i in phase["slots"] if i < len(aggregated_slots)]
-            if not idx_list:
-                continue
-            p_prices  = [prices[i] for i in idx_list]
-            p_pcs     = [pcs[i]    for i in idx_list]
-            p_vols    = [vols[i]   for i in idx_list]
-            p_vss     = [vss[i]    for i in idx_list]
-            # Volatility = avg slot high-low range as % of open
-            p_hl_pct  = [round(((aggregated_slots[i]["high"] - aggregated_slots[i]["low"]) / aggregated_slots[i]["open"]) * 100, 2)
-                         if aggregated_slots[i]["open"] > 0 else 0.0 for i in idx_list]
-            phase_stats[phase["name"]] = {
-                "label":        phase["label"],
-                "avg_pc":       safe_avg(p_pcs),
-                "phase_yield":  phase_yield(idx_list),
-                "mean_price":   safe_avg(p_prices),
-                "total_volume": sum(p_vols),
-                "vol_share":    round((sum(p_vols) / total_vol) * 100, 1),
-                "avg_vs":       safe_avg(p_vss),
-                "volatility":   safe_avg(p_hl_pct),
-                # Persistence: % of slots in the phase that are green (pc > 0)
-                "persistence":  round((sum(1 for x in p_pcs if x > 0) / len(p_pcs)) * 100, 1) if p_pcs else 0.0,
-                "slots":        len(idx_list),
-            }
-            
-        payload = {
-            "s": "ok",
-            "candles": plotly_candles,
-            "phase_stats": phase_stats,
-            "grid_data": {
-                "data": {symbol: {"price": prices, "percent_change": pcs, "volume": vols, "volume_strength": vss}},
-                "slot_labels": labels,
-                "daily_summary": {symbol: {
-                    "current_price": prices[-1] if prices else 0,
-                    "percent_change": pcs[-1] if pcs else 0, 
-                    "total_volume": sum(vols)
-                }},
-                "phases": [{"name": f"{timeframe}m Setup", "colSpan": len(labels), "bg": "bg-indigo-500/10 text-indigo-500"}]
-            }
+    from app.core.phases import PhaseEngine
+    phase_stats = PhaseEngine.calculate_stats(aggregated_slots)
+        
+    payload = {
+        "s": "ok",
+        "candles": plotly_candles,
+        "phase_stats": phase_stats,
+        "grid_data": {
+            "data": {symbol: {
+                "price": prices, 
+                "price_move": inr_moves,
+                "percent_change": pcs, 
+                "volume": vols, 
+                "volume_strength": vss
+            }},
+            "slot_labels": labels,
+            "daily_summary": {symbol: {
+                "current_price": prices[-1] if prices else 0,
+                "percent_change": pcs[-1] if pcs else 0, 
+                "total_volume": sum(vols),
+                "price_move": round(prices[-1] - aggregated_slots[0]["open"], 2) if prices and aggregated_slots else 0
+            }},
+            "phases": [{"name": f"{timeframe}m Setup", "colSpan": len(labels), "bg": "bg-indigo-500/10 text-indigo-500"}]
         }
-        return payload
-    except Exception as e:
-        logging.error(f"Failed to fetch historical data: {e}")
-        return {"s": "error", "message": "Failed to fetch historical data from broker"}
+    }
+    return payload
+@router.post("/bulk-phase-scan")
+async def bulk_phase_scan(data: dict):
+    """
+    Ranks multiple symbols by their phase performance.
+    Request: { symbols: [...], start_date, end_date }
+    """
+    if not state.active_broker:
+        raise HTTPException(status_code=400, detail="No active broker session")
+    
+    symbols = data.get("symbols", [])
+    start_date = data.get("start_date")
+    end_date = data.get("end_date")
+    
+    if not symbols or not start_date or not end_date:
+        raise HTTPException(status_code=400, detail="Missing required scan parameters")
+
+    from app.core.phases import PhaseEngine
+    results = {}
+    
+    # Standardize interval
+    interval = "1" if state.active_broker_name == "FYERS" else "minute"
+    
+    # Process symbols in batches to respect rate limits
+    for sym in symbols:
+        try:
+            raw_candles = await state.active_broker.fetch_history(sym, interval, start_date, end_date)
+            
+            # Use a simplified aggregator for the scan
+            aggregated = []
+            current = None
+            for c in raw_candles:
+                dt = c.get('timestamp') or c.get('date')
+                if not isinstance(dt, datetime):
+                    dt = datetime.fromtimestamp(int(dt)) if isinstance(dt, (int, str)) else dt
+                
+                m_start = dt.replace(hour=9, minute=15, second=0, microsecond=0)
+                if dt < m_start: continue
+                
+                # 25-min slots for consistency with dashboard
+                slot_idx = int(((dt - m_start).total_seconds() / 60) // 25)
+                label = (m_start + timedelta(minutes=slot_idx * 25)).strftime("%H:%M")
+                
+                if not current or current["label"] != label:
+                    if current: aggregated.append(current)
+                    current = {
+                        "label": label, 
+                        "epoch": int(dt.timestamp()), # Added epoch for day-grouping
+                        "open": c['open'], 
+                        "high": c['high'], 
+                        "low": c['low'], 
+                        "close": c['close'], 
+                        "volume": c['volume']
+                    }
+                else:
+                    current["high"] = max(current["high"], c['high'])
+                    current["low"] = min(current["low"], c['low'])
+                    current["close"] = c['close']
+                    current["volume"] += c['volume']
+            if current: aggregated.append(current)
+            
+            if aggregated:
+                results[sym] = PhaseEngine.calculate_stats(aggregated)
+        except Exception as e:
+            logging.error(f"Scan error for {sym}: {e}")
+            continue
+
+    # Transpose for easier UI consumption (Phase -> Symbol Stats)
+    transposed = {p["name"]: [] for p in PhaseEngine.PHASE_BOUNDS}
+    for sym, phases in results.items():
+        for p_name, stats in phases.items():
+            if p_name in transposed:
+                entry = stats.copy()
+                entry["symbol"] = sym
+                transposed[p_name].append(entry)
+                
+    # Sort each phase by Trend Strength (Persistence) by default
+    for p_name in transposed:
+        transposed[p_name].sort(key=lambda x: x.get("persistence", 0), reverse=True)
+
+    return {"status": "success", "scan_results": transposed}
+
+@router.post("/save-phase-dna")
+async def save_phase_dna(data: dict, db: AsyncSession = Depends(get_async_db)):
+    """Saves backtested benchmarks for a symbol."""
+    from app.core.profiles import ProfileManager
+    symbol = data.get("symbol")
+    benchmarks = data.get("benchmarks")
+    period = data.get("period", "30 Days")
+    
+    if not symbol or not benchmarks:
+        raise HTTPException(status_code=400, detail="Missing symbol or benchmarks")
+        
+    success = await ProfileManager.save_dna(db, symbol, benchmarks, period)
+    if success:
+        # Update the live state in memory too
+        state.phase_dnas[symbol] = benchmarks
+        return {"status": "success", "message": f"DNA for {symbol} saved to live agent."}
+    else:
+        raise HTTPException(status_code=500, detail="Failed to save DNA profile")
+
+@router.post("/simulate-phase-strategy")
+async def simulate_phase_strategy(data: dict):
+    """Runs a 5-year simulation based on symbol DNA."""
+    from app.core.simulator import PhaseSimulator
+    from app.core.history_cache import HistoryCache
+    
+    symbol = data.get("symbol")
+    dna = data.get("dna")
+    start_date = data.get("start_date", "2019-01-01")
+    end_date = data.get("end_date", datetime.now().strftime("%Y-%m-%d"))
+    
+    if not symbol or not dna:
+        raise HTTPException(status_code=400, detail="Missing symbol or DNA")
+        
+    cache = HistoryCache()
+    interval = "1" # Use 1m data for simulation
+    
+    start_dt = datetime.strptime(start_date, "%Y-%m-%d")
+    end_dt = datetime.strptime(end_date, "%Y-%m-%d").replace(hour=23, minute=59, second=59)
+    
+    # Cap end_dt at now
+    now = datetime.now()
+    if end_dt > now:
+        end_dt = now
+    
+    # We pull from cache (assuming user has already fetched history once)
+    candles = cache.get_candles(symbol, interval, int(start_dt.timestamp()), int(end_dt.timestamp()))
+    
+    if not candles:
+        return {"status": "error", "message": "No historical data in cache. Please fetch history first."}
+        
+    sim = PhaseSimulator(initial_capital=100000)
+    results = sim.simulate(symbol, candles, dna)
+    return {"status": "success", "results": results}
+
+@router.get("/order-summary")
+async def get_order_summary():
+    """Returns the current state of the execution engine."""
+    return state.order_manager.get_summary()
+
+@router.post("/close-all-positions")
+async def close_all_positions():
+    """Safety kill switch."""
+    # Implementation would iterate and close via broker
+    return {"status": "success", "message": "All orders cancelled (Mock)"}
 
 @router.post("/set-feed-mode")
 async def set_feed_mode(data: FeedModeUpdate):

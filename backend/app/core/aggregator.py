@@ -188,6 +188,7 @@ class AggregationEngine:
             slots = state_data["history"] + [state_data["current_slot"]]
             
             prices = [None] * len(labels)
+            inr_moves = [None] * len(labels)
             pcs = [None] * len(labels)
             vols = [None] * len(labels)
             vss = [None] * len(labels)
@@ -199,29 +200,62 @@ class AggregationEngine:
                     prices[idx] = s["close"]
                     vols[idx] = s["volume"]
                     
-                    pc = round(((s["close"] - s["open"]) / s["open"]) * 100, 2) if s["open"] > 0 else 0.0
+                    inr = round(s["close"] - s["open"], 2)
+                    inr_moves[idx] = inr
+                    
+                    pc = round((inr / s["open"]) * 100, 2) if s["open"] > 0 else 0.0
                     pcs[idx] = pc
                     
-                    past_vols = []
-                    for h in state_data["history"]:
-                        if h["label"] in labels and labels.index(h["label"]) < idx:
-                            past_vols.append(h["volume"])
-                            
-                    avg = sum(past_vols)/len(past_vols) if past_vols else s["volume"]
-                    vs = round((s["volume"] / avg) * 100, 2) if avg > 0 else 100.0
+                    slot_dt = datetime.fromtimestamp(s["epoch"]) if "epoch" in s else datetime.now()
+                    if slot_dt.hour == 9 and slot_dt.minute == 15:
+                        vs = 100.0
+                    else:
+                        past_vols = []
+                        for h in state_data["history"]:
+                            if h["label"] in labels and labels.index(h["label"]) < idx:
+                                past_vols.append(h["volume"])
+                                
+                        avg = sum(past_vols)/len(past_vols) if past_vols else s["volume"]
+                        vs = round((s["volume"] / avg) * 100, 2) if avg > 0 else 100.0
                     vss[idx] = vs
                     
+            from app.core.phases import PhaseEngine, PhaseSentinel
+            p_stats = PhaseEngine.calculate_stats(slots)
+            
+            # Find the "Active Phase" stats to evaluate alerts
+            # Fetch DNA from global state if available
+            from app.state import state
+            symbol_dna = state.phase_dnas.get(sym, {})
+            
+            active_phase_name = None
+            if p_stats:
+                active_phase_name = list(p_stats.keys())[-1]
+                
+            alerts = []
+            if active_phase_name:
+                # Use custom DNA if available, else fall back to sensible defaults
+                benchmarks = symbol_dna.get(active_phase_name, {
+                    "min_strength": 60, 
+                    "min_vol": 10, 
+                    "max_volatility": 1.5
+                })
+                alerts = PhaseSentinel.evaluate(sym, active_phase_name, p_stats[active_phase_name], benchmarks)
+
             payload["data"][sym] = {
                 "price": prices,
+                "price_move": inr_moves,
                 "percent_change": pcs,
                 "volume": vols,
-                "volume_strength": vss
+                "volume_strength": vss,
+                "phase_stats": p_stats,
+                "phase_alerts": alerts
             }
             
             curr_slot = state_data["current_slot"]
             payload["daily_summary"][sym] = {
                 "current_price": curr_slot["close"],
                 "percent_change": pcs[labels.index(curr_slot["label"])] if curr_slot["label"] in labels else 0.0,
+                "price_move": round(curr_slot["close"] - slots[0]["open"], 2) if slots else 0,
                 "total_volume": sum(s["volume"] for s in slots)
             }
             

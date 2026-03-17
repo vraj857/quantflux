@@ -1,5 +1,6 @@
 import os
 from sqlalchemy.ext.asyncio import create_async_engine, AsyncSession, async_sessionmaker
+from sqlalchemy import text
 from sqlalchemy.orm import declarative_base
 
 # Use aiosqlite for async support
@@ -14,8 +15,10 @@ engine = create_async_engine(
 # Enable WAL mode for SQLite async
 async def init_async_db():
     async with engine.begin() as conn:
-        await conn.execute("PRAGMA journal_mode=WAL")
-        # Base.metadata.create_all would be called here via conn.run_sync
+        await conn.execute(text("PRAGMA journal_mode=WAL"))
+        # Ensure the PhaseDNA model is imported so it's registered in metadata
+        from app.models.profile import PhaseDNA
+        await conn.run_sync(Base.metadata.create_all)
 
 # Global session maker
 AsyncSessionLocal = async_sessionmaker(

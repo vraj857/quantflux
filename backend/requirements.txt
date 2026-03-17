@@ -1,0 +1,14 @@
+fastapi
+uvicorn
+sqlalchemy[asyncio]
+aiosqlite
+pydantic
+pydantic-settings
+requests
+cryptography
+redis
+python-json-logger
+fyers-apiv3
+kiteconnect
+python-dotenv
+pybreaker

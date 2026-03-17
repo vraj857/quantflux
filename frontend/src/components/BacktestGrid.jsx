@@ -4,6 +4,7 @@ import { Download, CalendarDays } from 'lucide-react';
 import { METRIC_CONFIG, PHASES_25 } from '../constants';
 
 const BacktestGridSymbolBlock = ({ symbol, dates, timeMap, dataObj, theme, unifiedTimes }) => {
+    const numMetrics = METRIC_CONFIG.length;
     const rows = [];
     dates.forEach((dateStr, dateIdx) => {
         // Compute daily summary dynamically for the given date
@@ -13,6 +14,7 @@ const BacktestGridSymbolBlock = ({ symbol, dates, timeMap, dataObj, theme, unifi
         
         const dayLastPrice = dataObj.price?.[lastIdx] || 0;
         const dayTotalVol = dateIndices.reduce((sum, idx) => sum + (dataObj.volume?.[idx] || 0), 0);
+        const dayINRMove = dataObj.price_move ? dateIndices.reduce((sum, idx) => sum + (dataObj.price_move[idx] || 0), 0) : 0;
         
         let dayPC = 0;
         if (dataObj.price && dataObj.percent_change && firstIdx !== undefined && lastIdx !== undefined) {
@@ -30,8 +32,20 @@ const BacktestGridSymbolBlock = ({ symbol, dates, timeMap, dataObj, theme, unifi
             
             const dataKey = m.key;
             const isPrice = m.label === "Price";
+            const isMoveINR = m.label === "INR";
             const isPC = m.label === "PC %";
             const isVS = m.label === "VS %";
+
+            let dayHigh = null;
+            let dayLow = null;
+            if (isPrice) {
+                const dateIndices = Object.values(timeMap[dateStr] || {});
+                const datePrices = dateIndices.map(idx => dataObj.price?.[idx]).filter(p => p != null && p !== undefined);
+                if (datePrices.length > 0) {
+                    dayHigh = Math.max(...datePrices);
+                    dayLow = Math.min(...datePrices);
+                }
+            }
 
             rows.push(
                 <tr key={`${symbol}-${dateStr}-${m.label}`} className={clsx(
@@ -39,7 +53,7 @@ const BacktestGridSymbolBlock = ({ symbol, dates, timeMap, dataObj, theme, unifi
                     theme === 'dark' ? "border-white/5 hover:bg-white/[0.02]" : "border-gray-100 hover:bg-gray-50/50"
                 )}>
                     {isFirstOfSymbol && (
-                        <td rowSpan={dates.length * 4} className={clsx(
+                        <td rowSpan={dates.length * numMetrics} className={clsx(
                             "p-4 align-top border-r min-w-[100px] max-w-[100px] sticky left-0 z-20 overflow-hidden",
                             theme === 'dark' ? "border-white/10 bg-[#0a0a0a]" : "border-gray-200 bg-white"
                         )}>
@@ -59,7 +73,7 @@ const BacktestGridSymbolBlock = ({ symbol, dates, timeMap, dataObj, theme, unifi
                         </td>
                     )}
                     {isFirstOfDate && (
-                        <td rowSpan={4} className={clsx(
+                        <td rowSpan={numMetrics} className={clsx(
                             "p-3 align-middle border-r min-w-[80px] max-w-[80px] text-center sticky left-[100px] z-20 whitespace-normal",
                             theme === 'dark' ? "border-white/10 bg-[#111111]" : "border-gray-200 bg-gray-50"
                         )}>
@@ -81,20 +95,44 @@ const BacktestGridSymbolBlock = ({ symbol, dates, timeMap, dataObj, theme, unifi
                         const dataIndex = timeMap[dateStr]?.[timeKey];
                         const val = dataIndex !== undefined ? dataObj[dataKey]?.[dataIndex] : undefined;
                         
+                        // Sentiment logic: Requires both Price Change % and Volume Strength %
+                        const pcVal = dataIndex !== undefined ? dataObj.percent_change?.[dataIndex] : undefined;
+                        const vsVal = dataIndex !== undefined ? dataObj.volume_strength?.[dataIndex] : undefined;
+
+                        let sentimentBg = theme === 'dark' ? "bg-zinc-900/40" : "bg-gray-100/60";
+                        if (vsVal !== undefined && pcVal !== undefined) {
+                            if (vsVal > 120) {
+                                // High Conviction
+                                if (pcVal > 0) sentimentBg = theme === 'dark' ? "bg-emerald-500/20" : "bg-emerald-100";
+                                else if (pcVal < 0) sentimentBg = theme === 'dark' ? "bg-rose-500/20" : "bg-rose-100";
+                            } else if (vsVal < 70) {
+                                // Muted / Low Conviction
+                                if (pcVal > 0) sentimentBg = theme === 'dark' ? "bg-emerald-500/10" : "bg-emerald-50";
+                                else if (pcVal < 0) sentimentBg = theme === 'dark' ? "bg-rose-500/10" : "bg-rose-50";
+                            }
+                        }
+                        
                         return (
                             <td key={timeKey} className={clsx(
                                 "p-2 text-center text-xs font-mono font-bold transition-all border",
                                 isPC && val > 0 && "text-emerald-500",
                                 isPC && val < 0 && "text-rose-500",
+                                isMoveINR && val > 0 && (theme === 'dark' ? "text-emerald-400" : "text-emerald-600"),
+                                isMoveINR && val < 0 && (theme === 'dark' ? "text-rose-400" : "text-rose-600"),
                                 isVS && val > 150 && (theme === 'dark' ? "bg-amber-500/10 text-amber-500" : "bg-amber-50 text-amber-600"),
                                 isVS && val < 50 && "text-gray-600 opacity-50",
-                                theme === 'dark' ? "border-white/10 bg-zinc-900/40" : "border-gray-300 bg-gray-100/60"
+                                sentimentBg,
+                                // Range Markers
+                                isPrice && val !== undefined && val === dayHigh && "ring-2 ring-blue-500 ring-inset z-10",
+                                isPrice && val !== undefined && val === dayLow && "ring-2 ring-rose-700 ring-inset z-10",
+                                theme === 'dark' ? "border-white/10" : "border-gray-200"
                             )}>
                                 {val !== undefined && val !== null ? (
                                     isPC ? `${val > 0 ? '+' : ''}${val}%` :
                                         isVS ? `${val}%` :
                                             isPrice ? val.toLocaleString('en-IN') :
-                                                val.toLocaleString('en-IN')
+                                                isMoveINR ? `${val > 0 ? '+' : ''}${val.toFixed(2)}` :
+                                                    val.toLocaleString('en-IN')
                                 ) : '-'}
                             </td>
                         );
@@ -104,6 +142,11 @@ const BacktestGridSymbolBlock = ({ symbol, dates, timeMap, dataObj, theme, unifi
                         theme === 'dark' ? "border-white/10 bg-zinc-900" : "border-gray-300 bg-gray-100"
                     )}>
                         {m.label === "Price" ? dayLastPrice.toLocaleString('en-IN', { minimumFractionDigits: 2, maximumFractionDigits: 2 }) :
+                         m.label === "INR" ? (
+                            <span className={clsx(dayINRMove > 0 ? "text-emerald-500" : dayINRMove < 0 ? "text-rose-500" : "text-gray-500")}>
+                                {dayINRMove > 0 ? '+' : ''}{dayINRMove.toFixed(2)}
+                            </span>
+                         ) :
                          m.label === "PC %" ? (
                              <span className={clsx(dayPC > 0 ? "text-emerald-500" : dayPC < 0 ? "text-rose-500" : "text-gray-500")}>
                                  {dayPC > 0 ? '+' : ''}{dayPC.toFixed(2)}%
@@ -150,7 +193,7 @@ const BacktestGrid = ({ data, theme }) => {
     };
 
     const downloadCSV = () => {
-        let csv = 'Date,Time,Symbol,Price,PC %,Volume,VS %\n';
+        let csv = 'Date,Time,Symbol,Price,INR,PC %,Volume,VS %\n';
         symbols.forEach(sym => {
             const symData = data.data[sym];
             dates.forEach(dateStr => {
@@ -158,10 +201,11 @@ const BacktestGrid = ({ data, theme }) => {
                     const idx = timeMap[dateStr][timeKey];
                     if (idx !== undefined) {
                         const price = symData.price?.[idx] || 0;
+                        const inr = symData.price_move?.[idx] || 0;
                         const pc = symData.percent_change?.[idx] || 0;
                         const vol = symData.volume?.[idx] || 0;
                         const vs = symData.volume_strength?.[idx] || 0;
-                        csv += `${dateStr},${timeKey},${sym},${price},${pc},${vol},${vs}\n`;
+                        csv += `${dateStr},${timeKey},${sym},${price},${inr},${pc},${vol},${vs}\n`;
                     }
                 });
             });

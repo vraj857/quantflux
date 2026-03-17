@@ -53,6 +53,11 @@ class IBroker(ABC):
         """Checks if the broker session and ticker are active."""
         pass
 
+    @abstractmethod
+    async def validate_token(self) -> bool:
+        """Verifies if the current access token is still valid with the broker."""
+        pass
+
     @property
     @abstractmethod
     def last_tick_times(self) -> Dict[str, datetime]:

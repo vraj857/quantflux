@@ -11,8 +11,12 @@ class BrokerSession(Base):
 
     id = Column(Integer, primary_key=True, index=True)
     broker = Column(String, index=True)  # "FYERS" or "ZERODHA"
-    access_token = Column(String)  # Should ideally be encrypted in production
-    refresh_token = Column(String, nullable=True)
+    
+    # Encrypted fields for Enterprise Security
+    encrypted_access_token = Column(String)  # AES-256-GCM encrypted
+    encrypted_refresh_token = Column(String, nullable=True)
+    encrypted_dek = Column(String)  # Wrapped Data Encryption Key
+    encryption_iv = Column(String)  # Initialization Vector
     
     # Session Metadata
     user_name = Column(String, nullable=True)

@@ -12,8 +12,13 @@ from config import (
 )
 from typing import Dict, Any
 import logging
+from sqlalchemy import select, update
+from app.security.encryption import security_engine
+from app.services.broker_state import state_store
+from app.core.audit import audit_log
+from app.workers.reauth import fyers_breaker, zerodha_breaker
 
-router = APIRouter(prefix="/api/auth", tags=["auth"])
+router = APIRouter(prefix="/api/auth", tags=["Authentication"])
 
 @router.get("/fyers/login")
 async def get_fyers_login_url():
@@ -45,22 +50,28 @@ async def fyers_callback(auth_code: str = Query(None), db: AsyncSession = Depend
         access_token = await adapter.authenticate({"auth_code": auth_code})
         profile = await adapter.get_profile()
         
-        # Persist session
+        # 1. Encrypt token for Zero-Trust storage
+        encrypted = security_engine.encrypt(access_token)
+
+        # 2. Persist in DB (Encrypted)
         new_session = BrokerSession(
             broker="FYERS",
-            access_token=access_token,
+            encrypted_access_token=encrypted["encrypted_data"],
+            encrypted_dek=encrypted["wrapped_dek"],
+            encryption_iv=encrypted["iv"],
             user_name=profile.get("name"),
             user_id=profile.get("client_id"),
-            extra_data=profile
+            extra_data=profile,
+            is_active=1
         )
         db.add(new_session)
         await db.commit()
-        
-        # Update global state
-        from app.main import on_tick_received
-        adapter.on_tick_callback = on_tick_received
-        state.active_broker = adapter
-        state.active_broker_name = "FYERS"
+
+        # 3. Cache in Redis for Stateless instances
+        await state_store.save_session(profile.get("client_id"), "FYERS", encrypted)
+
+        # 4. Audit Log
+        audit_log.log_event("SESSION_CREATED", broker="FYERS", user_id=profile.get("client_id"), message="Fyers session established via callback")
         
         return RedirectResponse(url=f"{FRONTEND_URL}?auth_success=fyers")
     except Exception as e:
@@ -84,62 +95,94 @@ async def kite_callback(request_token: str = Query(None), db: AsyncSession = Dep
         access_token = await adapter.authenticate({"request_token": request_token})
         profile = await adapter.get_profile()
         
-        # Persist session
+        # 1. Encrypt token for Zero-Trust storage
+        encrypted = security_engine.encrypt(access_token)
+
+        # 2. Persist in DB (Encrypted)
         new_session = BrokerSession(
             broker="ZERODHA",
-            access_token=access_token,
+            encrypted_access_token=encrypted["encrypted_data"],
+            encrypted_dek=encrypted["wrapped_dek"],
+            encryption_iv=encrypted["iv"],
             user_name=profile.get("name"),
-            user_id=profile.get("client_id")
+            user_id=profile.get("client_id"),
+            is_active=1
         )
         db.add(new_session)
         await db.commit()
-        
-        # Update global state
-        from app.main import on_tick_received
-        adapter.on_tick_callback = on_tick_received
-        state.active_broker = adapter
-        state.active_broker_name = "ZERODHA"
+
+        # 3. Cache in Redis for Stateless instances
+        await state_store.save_session(profile.get("client_id"), "ZERODHA", encrypted)
+
+        # 4. Audit Log
+        audit_log.log_event("SESSION_CREATED", broker="ZERODHA", user_id=profile.get("client_id"), message="Zerodha session established via callback")
         
         return RedirectResponse(url=f"{FRONTEND_URL}?auth_success=zerodha")
     except Exception as e:
         logging.error(f"Zerodha Callback Error: {e}")
         return RedirectResponse(url=f"{FRONTEND_URL}?auth_error={str(e)}")
 
-@router.post("/configure")
-async def configure_broker(data: dict):
-    """Manually set broker credentials/token."""
+@router.post("/set-session")
+async def set_broker_session(data: Dict[str, Any], db: AsyncSession = Depends(get_async_db)):
+    """Manually set broker credentials/token with Enterprise Encryption."""
     broker = data.get("broker", "ZERODHA")
     token = data.get("access_token")
-    if broker == "FYERS":
-        adapter = FyersAdapter(FYERS_APP_ID, FYERS_SECRET_KEY, FYERS_REDIRECT_URL)
-        adapter.access_token = token
-        from fyers_apiv3 import fyersModel
-        adapter.api = fyersModel.FyersModel(client_id=adapter.client_id, token=token, is_async=False, log_path="")
-        from app.main import on_tick_received
-        adapter.on_tick_callback = on_tick_received
-        state.active_broker = adapter
-        state.active_broker_name = "FYERS"
-    elif broker == "ZERODHA":
-        adapter = ZerodhaAdapter(KITE_API_KEY, KITE_API_SECRET)
-        adapter.access_token = token
-        from kiteconnect import KiteConnect
-        adapter.api = KiteConnect(api_key=KITE_API_KEY)
-        adapter.api.set_access_token(token)
-        from app.main import on_tick_received
-        adapter.on_tick_callback = on_tick_received
-        state.active_broker = adapter
-        state.active_broker_name = "ZERODHA"
+    user_id = data.get("user_id", "default_user") # Assuming a user_id is provided or default
+
+    # 1. Encrypt token for Zero-Trust storage
+    encrypted = security_engine.encrypt(token)
+    
+    # 2. Persist in DB (Encrypted)
+    new_session = BrokerSession(
+        broker=broker,
+        encrypted_access_token=encrypted["encrypted_data"],
+        encrypted_dek=encrypted["wrapped_dek"],
+        encryption_iv=encrypted["iv"],
+        user_id=user_id,
+        is_active=1
+    )
+    db.add(new_session)
+    await db.commit()
+    
+    # 3. Cache in Redis for Stateless instances
+    await state_store.save_session(user_id, broker, encrypted)
+    
+    # 4. Audit Log
+    audit_log.log_event("SESSION_CREATED", broker=broker, user_id=user_id, message="Manual session established")
+    
     return {"status": "success"}
+
+async def validate_and_cleanup_session(adapter: Any, session_id: int, db: AsyncSession) -> bool:
+    """Verifies a session and deactivates it in DB if expired."""
+    logging.info(f"Validating session {session_id} for {adapter.__class__.__name__}...")
+    if await adapter.validate_token():
+        return True
+    
+    logging.warning(f"Session {session_id} is expired. Deactivating in DB.")
+    from sqlalchemy import update
+    await db.execute(
+        update(BrokerSession)
+        .where(BrokerSession.id == session_id)
+        .values(is_active=0)
+    )
+    await db.commit()
+    return False
 
 @router.get("/status")
 async def get_session_status(db: AsyncSession = Depends(get_async_db)):
     """Checks if a broker session is active. Falls back to DB if in-memory state was lost."""
     # Fast path: in-memory broker is already set
     if state.active_broker is not None:
-        return {"authenticated": True, "broker": state.active_broker_name}
+        # Get session ID for the in-memory broker if it exists
+        # Actually it's easier to just re-validate and if it fails, clear and go to DB slow path
+        if await state.active_broker.validate_token():
+            return {"authenticated": True, "broker": state.active_broker_name}
+        else:
+            logging.warning(f"In-memory session for {state.active_broker_name} is expired. Clearing.")
+            state.active_broker = None
+            state.active_broker_name = None
 
-    # Slow path: try to restore from DB (happens after uvicorn --reload)
-    from sqlalchemy import select
+    # Slow path: try to restore from DB
     result = await db.execute(
         select(BrokerSession)
         .filter(BrokerSession.is_active == 1)
@@ -151,32 +194,39 @@ async def get_session_status(db: AsyncSession = Depends(get_async_db)):
     if not last_session:
         return {"authenticated": False, "broker": None}
 
-    # Restore the adapter in-memory so the app works again
     try:
         from config import FYERS_APP_ID, FYERS_SECRET_KEY, FYERS_REDIRECT_URL, KITE_API_KEY, KITE_API_SECRET
+        
+        # 1. Decrypt token using stored metadata
+        decrypted_token = security_engine.decrypt(
+            last_session.encrypted_access_token,
+            last_session.encrypted_dek,
+            last_session.encryption_iv
+        )
+
+        adapter = None
         if last_session.broker == "FYERS":
             adapter = FyersAdapter(FYERS_APP_ID, FYERS_SECRET_KEY, FYERS_REDIRECT_URL)
-            adapter.access_token = last_session.access_token
+            adapter.access_token = decrypted_token
             from fyers_apiv3 import fyersModel
-            adapter.api = fyersModel.FyersModel(
-                client_id=adapter.client_id,
-                token=adapter.access_token,
-                is_async=False,
-                log_path=""
+            # Wrap in Circuit Breaker
+            adapter.api = await fyers_breaker.call(
+                lambda: fyersModel.FyersModel(client_id=adapter.client_id, token=adapter.access_token, is_async=False, log_path="")
             )
-            state.active_broker = adapter
-            state.active_broker_name = "FYERS"
         elif last_session.broker == "ZERODHA":
             adapter = ZerodhaAdapter(KITE_API_KEY, KITE_API_SECRET)
-            adapter.access_token = last_session.access_token
+            adapter.access_token = decrypted_token
             from kiteconnect import KiteConnect
             adapter.api = KiteConnect(api_key=KITE_API_KEY)
-            adapter.api.set_access_token(adapter.access_token)
-            state.active_broker = adapter
-            state.active_broker_name = "ZERODHA"
+            # Wrap in Circuit Breaker
+            await zerodha_breaker.call(lambda: adapter.api.set_access_token(adapter.access_token))
 
-        logging.info(f"Session auto-restored from DB: {last_session.broker}")
-        return {"authenticated": True, "broker": last_session.broker}
+        if adapter and await validate_and_cleanup_session(adapter, last_session.id, db):
+            # NO LONGER STORING IN state.active_broker (Stateless)
+            # We return success, child requests will re-load from Redis/DB
+            return {"authenticated": True, "broker": last_session.broker}
+        
+        return {"authenticated": False, "broker": None}
     except Exception as e:
         logging.error(f"Failed to auto-restore session: {e}")
         return {"authenticated": False, "broker": None}
@@ -191,15 +241,31 @@ async def get_broker_profile(db: AsyncSession = Depends(get_async_db)):
         .order_by(BrokerSession.created_at.desc())
         .limit(1)
     )
-    session = result.scalar_one_or_none()
-    if not session:
+    last_session = result.scalar_one_or_none()
+    
+    if not last_session:
         return {"authenticated": False, "user_name": None, "user_id": None, "broker": None}
-    return {
-        "authenticated": True,
-        "broker": session.broker,
-        "user_name": session.user_name,
-        "user_id": session.user_id,
-    }
+
+    # Ensure it's still valid
+    from config import FYERS_APP_ID, FYERS_SECRET_KEY, FYERS_REDIRECT_URL, KITE_API_KEY, KITE_API_SECRET
+    adapter = None
+    if last_session.broker == "FYERS":
+        adapter = FyersAdapter(FYERS_APP_ID, FYERS_SECRET_KEY, FYERS_REDIRECT_URL)
+        adapter.api = fyersModel.FyersModel(client_id=FYERS_APP_ID, token=last_session.access_token, is_async=False, log_path="")
+    elif last_session.broker == "ZERODHA":
+        adapter = ZerodhaAdapter(KITE_API_KEY, KITE_API_SECRET)
+        adapter.api = KiteConnect(api_key=KITE_API_KEY)
+        adapter.api.set_access_token(last_session.access_token)
+
+    if adapter and await validate_and_cleanup_session(adapter, last_session.id, db):
+        return {
+            "authenticated": True,
+            "broker": last_session.broker,
+            "user_name": last_session.user_name,
+            "user_id": last_session.user_id,
+        }
+    
+    return {"authenticated": False, "user_name": None, "user_id": None, "broker": None}
 
 @router.post("/logout")
 async def logout(db: AsyncSession = Depends(get_async_db)):

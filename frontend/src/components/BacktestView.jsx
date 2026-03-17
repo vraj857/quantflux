@@ -73,7 +73,7 @@ const BacktestView = ({ theme }) => {
                 const data = await fetchSingle(selectedSymbol);
                 if (data.s === 'ok' && data.grid_data) {
                     setGridData(data.grid_data);
-                    if (data.phase_stats) setPhaseStatsList([data.phase_stats]);
+                    if (data.phase_stats) setPhaseStatsList([{ symbol: selectedSymbol, stats: data.phase_stats }]);
                 } else {
                     setError(data.message || 'No data found for this date range/symbol.');
                 }
@@ -104,7 +104,7 @@ const BacktestView = ({ theme }) => {
                                 Object.assign(merged.data, gd.data);
                             }
                             // Collect phase stats per symbol
-                            if (resp.phase_stats) allPhaseStats.push(resp.phase_stats);
+                            if (resp.phase_stats) allPhaseStats.push({ symbol: sym, stats: resp.phase_stats });
                             successCount++;
                         }
                     } catch (e) { /* skip failed symbols */ }
@@ -137,7 +137,7 @@ const BacktestView = ({ theme }) => {
     };
 
     return (
-        <div className={clsx('flex-1 p-6 flex flex-col min-h-0', theme === 'dark' ? 'bg-[#0a0a0a]' : 'bg-gray-50')}>
+        <div className={clsx('flex-1 p-6 flex flex-col min-h-0', theme === 'dark' ? 'bg-[#0a0a0a]' : 'bg-white')}>
             <div className="mb-4 flex items-end justify-between shrink-0">
                 <div>
                     <h1 className={clsx('text-2xl font-black mb-1 tracking-tight uppercase italic', theme === 'dark' ? 'text-white' : 'text-gray-900')}>

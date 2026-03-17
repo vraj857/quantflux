@@ -81,3 +81,8 @@ async def delete_watchlist(name: str, db: AsyncSession = Depends(get_async_db)):
     await db.execute(delete(WatchlistMember).filter(WatchlistMember.list_name == name))
     await db.commit()
     return {"status": "success", "deleted": name}
+
+async def get_watchlist_symbols(name: str, db: AsyncSession) -> List[str]:
+    """Internal helper to get symbols for a watchlist."""
+    result = await db.execute(select(WatchlistMember).filter(WatchlistMember.list_name == name))
+    return [i.symbol for i in result.scalars().all()]

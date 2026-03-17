@@ -2,7 +2,9 @@ import {
     LayoutDashboard,
     History,
     Monitor,
-    Settings
+    Settings,
+    Play,
+    Target
 } from 'lucide-react';
 
 export const TIME_SLOTS_25 = [
@@ -37,6 +39,7 @@ export const PHASES_25 = (theme) => [
 
 export const METRIC_CONFIG = [
     { label: "Price", key: "price" },
+    { label: "INR", key: "price_move" },
     { label: "PC %", key: "percent_change" },
     { label: "Vol", key: "volume" },
     { label: "VS %", key: "volume_strength" }
@@ -45,6 +48,8 @@ export const METRIC_CONFIG = [
 export const MENU_ITEMS = [
     { id: 'live', label: 'Live Feed', icon: Monitor },
     { id: 'backtest', label: 'Backtesting', icon: History },
+    { id: 'simulator', label: 'Strategy Sim', icon: Play },
+    { id: 'orders', label: 'Live Trades', icon: Target },
     { id: 'analytics', label: 'Dashboard', icon: LayoutDashboard },
     { id: 'settings', label: 'Configuration', icon: Settings },
 ];
