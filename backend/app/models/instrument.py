@@ -1,5 +1,5 @@
 from sqlalchemy import Column, Integer, String, BigInteger, UniqueConstraint
-from app.database import Base
+from app.infrastructure.database.base import Base
 
 class Instrument(Base):
     """

@@ -1,5 +1,5 @@
 from sqlalchemy import Column, Integer, String, Float, DateTime, Date
-from app.database import Base
+from app.infrastructure.database.base import Base
 from datetime import datetime
 
 class TradeLog(Base):

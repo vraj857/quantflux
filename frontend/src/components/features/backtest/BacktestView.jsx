@@ -1,11 +1,11 @@
 import React, { useState, useEffect } from 'react';
-import { Loader2, AlertCircle, Layers, TrendingUp, BarChart2, Grid } from 'lucide-react';
+import { Loader2, AlertCircle, Layers, TrendingUp, BarChart2, Grid, Maximize2, Minimize2 } from 'lucide-react';
 import { clsx } from 'clsx';
-import { api } from '../services/api';
+import { api } from '../../../api';
 import BacktestGrid from './BacktestGrid';
-import PhaseAnalyticsDashboard from './PhaseAnalyticsDashboard';
+import PhaseAnalyticsDashboard from '../analytics/PhaseAnalyticsDashboard';
 
-const BacktestView = ({ theme }) => {
+const BacktestView = ({ theme, activeView }) => {
     // Mode toggle: 'watchlist' | 'single'
     const [mode, setMode] = useState('single');
 
@@ -24,9 +24,11 @@ const BacktestView = ({ theme }) => {
     const [loading, setLoading] = useState(false);
     const [error, setError] = useState(null);
     const [progress, setProgress] = useState('');
+    const [isParametersCollapsed, setIsParametersCollapsed] = useState(false);
 
-    // Fetch collection names on mount
+    // Fetch collection names on mount OR when switching to this view
     useEffect(() => {
+        if (activeView !== 'backtest') return;
         const fetchCollections = async () => {
             try {
                 const data = await api.getWatchlistNames();
@@ -34,10 +36,11 @@ const BacktestView = ({ theme }) => {
             } catch (e) { setCollections(['Default']); }
         };
         fetchCollections();
-    }, []);
+    }, [activeView]);
 
-    // Fetch symbols whenever active collection changes
+    // Fetch symbols whenever active collection changes OR when switching to this view
     useEffect(() => {
+        if (activeView !== 'backtest') return;
         const fetchSymbols = async () => {
             try {
                 const data = await api.getWatchlist(activeCollection);
@@ -51,78 +54,90 @@ const BacktestView = ({ theme }) => {
             } catch (err) { console.error('Failed to fetch symbols', err); }
         };
         fetchSymbols();
-    }, [activeCollection]);
+    }, [activeCollection, activeView]);
 
     // Fetch historical data for a single symbol
     const fetchSingle = async (symbol) => {
         return await api.getHistoricalOHLC(symbol, startDate, endDate, timeframe);
     };
 
+    // High-performance Fetch Logic with Parallelization
     const handleFetch = async () => {
+        // 1. Reset State (Clean Start)
         setLoading(true);
         setError(null);
         setGridData(null);
         setPhaseStatsList([]);
         setResultsTab('grid');
-        setProgress('');
+        setProgress('Initializing engine...');
 
         try {
+            // Guard: Single Mode Validation
             if (mode === 'single') {
-                // ── Single stock mode ──
-                if (!selectedSymbol) { setError('Please select a symbol.'); return; }
-                const data = await fetchSingle(selectedSymbol);
-                if (data.s === 'ok' && data.grid_data) {
-                    setGridData(data.grid_data);
-                    if (data.phase_stats) setPhaseStatsList([{ symbol: selectedSymbol, stats: data.phase_stats }]);
-                } else {
-                    setError(data.message || 'No data found for this date range/symbol.');
+                if (!selectedSymbol) return setError('Please select a symbol.');
+                
+                const resp = await fetchSingle(selectedSymbol);
+                if (resp?.s !== 'ok' || !resp?.grid_data) {
+                    return setError(resp?.message || 'No data found for this range.');
+                }
+
+                setGridData(resp.grid_data);
+                if (resp.phase_stats) setPhaseStatsList([{ symbol: selectedSymbol, stats: resp.phase_stats }]);
+                return;
+            }
+
+            // Guard: Watchlist Mode Validation
+            if (!symbols.length) return setError('Selected watchlist has no symbols.');
+
+            // 2. Parallel Execution (Enterprise Scale)
+            // Using Promise.all provides a significant speedup vs sequential for-loops
+            setProgress(`Syncing 1 / ${symbols.length}...`);
+            const fetchResults = await Promise.all(
+                symbols.map(async (sym, index) => {
+                    try {
+                        const res = await fetchSingle(sym);
+                        // Progress update (approximate as they run in parallel)
+                        if (index % 5 === 0) setProgress(`Processing batch starting at ${index + 1}...`);
+                        return { symbol: sym, data: res };
+                    } catch (e) {
+                        return { symbol: sym, data: null };
+                    }
+                })
+            );
+
+            // 3. Optimized Merging (O(n))
+            const merged = { data: {}, slot_labels: [] };
+            const allPhaseStats = [];
+            let successCount = 0;
+
+            fetchResults.forEach(({ symbol, data: resp }) => {
+                if (resp?.s === 'ok' && resp?.grid_data) {
+                    // Lock slot_labels from the first healthy payload
+                    if (successCount === 0) merged.slot_labels = resp.grid_data.slot_labels ?? [];
+                    
+                    // Merge metrics
+                    if (resp.grid_data.data) Object.assign(merged.data, resp.grid_data.data);
+                    
+                    // Collect analytics
+                    if (resp.phase_stats) allPhaseStats.push({ symbol, stats: resp.phase_stats });
+                    successCount++;
+                }
+            });
+
+            // 4. Final Commit
+            setPhaseStatsList(allPhaseStats);
+            if (successCount > 0) {
+                setGridData(merged);
+                if (successCount < symbols.length) {
+                    setError(`Warning: Only ${successCount}/${symbols.length} symbols returned data.`);
                 }
             } else {
-                // ── Watchlist mode: fetch all symbols and deep-merge grid_data ──
-                // BacktestGrid expects: { data: { SYMBOL: {...} }, slot_labels: [...] }
-                // Each fetchSingle returns a grid_data with that same shape.
-                // We must keep slot_labels from the first result and merge all inner `data` maps.
-                if (symbols.length === 0) { setError('Selected watchlist has no symbols.'); return; }
-                
-                const merged = { data: {}, slot_labels: [] };
-                const allPhaseStats = [];
-                let successCount = 0;
-
-                for (let i = 0; i < symbols.length; i++) {
-                    const sym = symbols[i];
-                    setProgress(`Fetching ${i + 1} / ${symbols.length}: ${sym}`);
-                    try {
-                        const resp = await fetchSingle(sym);
-                        if (resp.s === 'ok' && resp.grid_data) {
-                            const gd = resp.grid_data;
-                            // Use slot_labels from the first successful result
-                            if (successCount === 0 && gd.slot_labels) {
-                                merged.slot_labels = gd.slot_labels;
-                            }
-                            // Deep-merge the inner `data` object (each key is a symbol)
-                            if (gd.data) {
-                                Object.assign(merged.data, gd.data);
-                            }
-                            // Collect phase stats per symbol
-                            if (resp.phase_stats) allPhaseStats.push({ symbol: sym, stats: resp.phase_stats });
-                            successCount++;
-                        }
-                    } catch (e) { /* skip failed symbols */ }
-                }
-                setPhaseStatsList(allPhaseStats);
-
-                setProgress('');
-                if (Object.keys(merged.data).length > 0) {
-                    setGridData(merged);
-                    if (successCount < symbols.length) {
-                        setError(`Data loaded for ${successCount}/${symbols.length} symbols. Some had no data for this range.`);
-                    }
-                } else {
-                    setError('No data found for any symbol in this watchlist for the selected date range.');
-                }
+                setError('No historical data found for any symbol in this range.');
             }
+
         } catch (err) {
-            setError('Backend service error. Check connection.');
+            setError('Architectural failure: Backend unreachable or malformed response.');
+            console.error(err);
         } finally {
             setLoading(false);
             setProgress('');
@@ -136,6 +151,15 @@ const BacktestView = ({ theme }) => {
         setError(null);
     };
 
+    // Auto-fetch automatically when the user changes the timeframe 
+    // to provide a seamless "First Time Right" enterprise experience.
+    useEffect(() => {
+        if (gridData && !loading) {
+            handleFetch();
+        }
+        // eslint-disable-next-line react-hooks/exhaustive-deps
+    }, [timeframe]);
+
     return (
         <div className={clsx('flex-1 p-6 flex flex-col min-h-0', theme === 'dark' ? 'bg-[#0a0a0a]' : 'bg-white')}>
             <div className="mb-4 flex items-end justify-between shrink-0">
@@ -147,7 +171,7 @@ const BacktestView = ({ theme }) => {
                 </div>
             </div>
 
-            <div className="w-full mb-6 shrink-0">
+            <div className={clsx("w-full mb-6 shrink-0 transition-all duration-300", isParametersCollapsed ? "h-0 opacity-0 overflow-hidden mb-0" : "h-auto opacity-100")}>
                 <div className={clsx('w-full border rounded-2xl p-4 shadow-sm', theme === 'dark' ? 'bg-zinc-950/50 border-white/5' : 'bg-white border-gray-200')}>
 
                     {/* Mode Toggle */}
@@ -272,14 +296,26 @@ const BacktestView = ({ theme }) => {
                 <div className="flex flex-col flex-1 min-h-0">
                     {/* Results Tab Switcher */}
                     <div className="flex items-center justify-between mb-4 shrink-0">
-                        <h3 className={clsx('text-sm font-black tracking-widest uppercase ml-1', theme === 'dark' ? 'text-gray-400' : 'text-gray-600')}>
-                            Results
-                            {mode === 'watchlist' && (
-                                <span className="ml-3 text-indigo-400 normal-case font-bold text-[10px]">
-                                    — {activeCollection} ({Object.keys(gridData.data).length} symbols)
-                                </span>
-                            )}
-                        </h3>
+                        <div className="flex items-center">
+                            <h3 className={clsx('text-sm font-black tracking-widest uppercase ml-1', theme === 'dark' ? 'text-gray-400' : 'text-gray-600')}>
+                                Results
+                                {mode === 'watchlist' && (
+                                    <span className="ml-3 text-indigo-400 normal-case font-bold text-[10px]">
+                                        — {activeCollection} ({Object.keys(gridData.data).length} symbols)
+                                    </span>
+                                )}
+                            </h3>
+                            <button
+                                onClick={() => setIsParametersCollapsed(!isParametersCollapsed)}
+                                className={clsx(
+                                    "ml-4 p-1.5 rounded-lg border transition-all hover:scale-110",
+                                    theme === 'dark' ? "bg-zinc-900 border-white/10 text-gray-400 hover:text-white" : "bg-gray-100 border-gray-200 text-gray-600 hover:text-black"
+                                )}
+                                title={isParametersCollapsed ? "Show Parameters" : "Maximize Grid"}
+                            >
+                                {isParametersCollapsed ? <Minimize2 size={14} /> : <Maximize2 size={14} />}
+                            </button>
+                        </div>
                         <div className={clsx('flex p-1 rounded-xl border', theme === 'dark' ? 'bg-black/20 border-white/5' : 'bg-gray-100 border-gray-200')}>
                             <button
                                 onClick={() => setResultsTab('grid')}

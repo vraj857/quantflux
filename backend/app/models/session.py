@@ -1,5 +1,5 @@
 from sqlalchemy import Column, Integer, String, DateTime, JSON
-from app.database import Base
+from app.infrastructure.database.base import Base
 from datetime import datetime
 
 class BrokerSession(Base):
@@ -28,4 +28,4 @@ class BrokerSession(Base):
     # Store any extra broker-specific payload (e.g. login response JSON)
     extra_data = Column(JSON, nullable=True)
     
-    is_active = Column(Integer, default=1)  # 1=Active, 0=Expired/Logged Out
+    session_active = Column(Integer, default=1)  # 1=Active, 0=Expired/Logged Out

@@ -1,21 +1,24 @@
-import React from 'react';
+import React, { memo, useMemo } from 'react';
 import { clsx } from 'clsx';
-import { Zap, AlertCircle } from 'lucide-react';
-import { TIME_SLOTS_25, PHASES_25, METRIC_CONFIG } from '../constants';
+import { Zap, AlertCircle, Radio, Wifi, WifiOff, Monitor, History } from 'lucide-react';
+import { TIME_SLOTS_25, PHASES_25, METRIC_CONFIG, getDynamicPhases } from '../../../constants';
 
-const MetricRow = ({ symbol, metric, data, isFirst, theme, slotCount, dailySummary }) => {
+// ─── Phase Mapping Helpers ──────────────────────────────────────────────────
+// ─── Phase Mapping Helpers ──────────────────────────────────────────────────
+
+const MetricRow = memo(({ symbol, metric, data, isFirst, theme, slotCount, dailySummary, isSubscribed }) => {
     const numMetrics = METRIC_CONFIG.length;
     const isPrice = metric === "Price";
     
-    let dayHigh = null;
-    let dayLow = null;
-    if (isPrice) {
-        const prices = (data.price || []).filter(p => p != null && p !== undefined);
-        if (prices.length > 0) {
-            dayHigh = Math.max(...prices);
-            dayLow = Math.min(...prices);
-        }
-    }
+    // Memoize High/Low calculations to avoid recalculating on every minor style change
+    const { dayHigh, dayLow } = useMemo(() => {
+        if (!isPrice) return { dayHigh: null, dayLow: null };
+        const prices = (data?.price || []).filter(p => p != null && p !== undefined);
+        return {
+            dayHigh: prices.length > 0 ? Math.max(...prices) : null,
+            dayLow: prices.length > 0 ? Math.min(...prices) : null
+        };
+    }, [isPrice, data?.price]);
 
     return (
         <tr className={clsx(
@@ -28,20 +31,24 @@ const MetricRow = ({ symbol, metric, data, isFirst, theme, slotCount, dailySumma
                     theme === 'dark' ? "border-white/10 bg-black/40" : "border-gray-200 bg-gray-50"
                 )}>
                     <div className="flex items-center space-x-4">
-                        {/* Symbol Name */}
                         <div className="flex flex-col shrink-0">
-                            <span className={clsx(
-                                "text-[7px] font-black uppercase tracking-widest leading-none mb-1 opacity-60",
-                                theme === 'dark' ? "text-indigo-400" : "text-indigo-600"
-                            )}>
-                                {symbol.includes(':') ? symbol.split(':')[0] : 'NSE'}
-                            </span>
+                            <div className="flex items-center space-x-1.5 mb-1">
+                                <div className={clsx(
+                                    "size-1.5 rounded-full flex-shrink-0",
+                                    isSubscribed ? "bg-emerald-400 animate-pulse" : "bg-gray-600"
+                                )} />
+                                <span className={clsx(
+                                    "text-[7px] font-black uppercase tracking-widest leading-none opacity-60",
+                                    theme === 'dark' ? "text-indigo-400" : "text-indigo-600"
+                                )}>
+                                    {symbol.includes(':') ? symbol.split(':')[0] : 'NSE'}
+                                </span>
+                            </div>
                             <span className={clsx("text-sm font-black tracking-tighter uppercase whitespace-nowrap", theme === 'dark' ? "text-white" : "text-gray-900")}>
                                 {symbol.includes(':') ? symbol.split(':')[1] : symbol}
                             </span>
                         </div>
 
-                        {/* Daily Stats (Inline) */}
                         <div className={clsx("flex flex-col border-l pl-3 shrink-0", theme === 'dark' ? "border-white/10" : "border-gray-200")}>
                             <div className="flex items-baseline space-x-1.5 leading-none mb-1">
                                 <span className={clsx("text-xs font-black", theme === 'dark' ? "text-white" : "text-gray-900")}>
@@ -64,8 +71,7 @@ const MetricRow = ({ symbol, metric, data, isFirst, theme, slotCount, dailySumma
                             </div>
                         </div>
 
-                        {/* Phase Health Alerts */}
-                        {data.phase_alerts && data.phase_alerts.length > 0 && (
+                        {data?.phase_alerts && data.phase_alerts.length > 0 && (
                             <div className="flex flex-col space-y-1 pl-3 border-l border-white/5 ml-auto overflow-hidden">
                                 {data.phase_alerts.slice(0, 2).map((alert, idx) => (
                                     <div key={idx} className={clsx(
@@ -97,7 +103,7 @@ const MetricRow = ({ symbol, metric, data, isFirst, theme, slotCount, dailySumma
                 const pcVal = data.percent_change?.[i];
                 const vsVal = data.volume_strength?.[i];
 
-                const isPrice = metric === "Price";
+                const isPriceRow = metric === "Price";
                 const isINR = metric === "INR";
                 const isPC = metric === "PC %";
                 const isVS = metric === "VS %";
@@ -123,14 +129,14 @@ const MetricRow = ({ symbol, metric, data, isFirst, theme, slotCount, dailySumma
                         isVS && val > 150 && (theme === 'dark' ? "bg-amber-500/10 text-amber-500" : "bg-amber-50 text-amber-600"),
                         isVS && val < 50 && "text-gray-600 opacity-50",
                         sentimentBg,
-                        isPrice && val !== undefined && val === dayHigh && "ring-2 ring-blue-500 ring-inset z-10",
-                        isPrice && val !== undefined && val === dayLow && "ring-2 ring-rose-700 ring-inset z-10",
+                        isPriceRow && val !== undefined && val !== null && val === dayHigh && "ring-2 ring-blue-500 ring-inset z-10",
+                        isPriceRow && val !== undefined && val !== null && val === dayLow && "ring-2 ring-rose-700 ring-inset z-10",
                         theme === 'dark' ? "border-white/10" : "border-gray-200"
                     )}>
                         {val !== undefined && val !== null ? (
                             isPC ? `${val > 0 ? '+' : ''}${val}%` :
                                 isVS ? `${val}%` :
-                                    isPrice ? val.toLocaleString('en-IN') :
+                                    isPriceRow ? val.toLocaleString('en-IN') :
                                         isINR ? `${val > 0 ? '+' : ''}${val.toFixed(2)}` :
                                             val.toLocaleString('en-IN')
                         ) : '-'}
@@ -139,47 +145,48 @@ const MetricRow = ({ symbol, metric, data, isFirst, theme, slotCount, dailySumma
             })}
         </tr>
     );
-};
+});
 
 
-const LiveFeedGrid = ({ data, theme }) => {
-    if (!data || !data.data) {
-        return (
-            <div className="flex-1 flex flex-col items-center justify-center space-y-4 opacity-50">
-                <div className="size-12 border-4 border-indigo-500/20 border-t-indigo-500 rounded-full animate-spin"></div>
-                <p className="text-gray-500 font-bold uppercase tracking-widest text-[10px]">Initializing Market Feed...</p>
-            </div>
-        );
-    }
+const LiveFeedGrid = ({ data, snapshot, subscriptions, theme }) => {
+    // ── Symbols to display: Prefer live data, fallback to subscriptions/snapshot ──
+    const symbolsFromData = Object.keys(data?.data || {});
+    const symbolsFromSubs = (subscriptions?.symbols || []).map(s => s.replace(/-EQ$/, ''));
+    const symbolsFromSnap = (snapshot?.quotes || []).map(q => q.symbol);
+    
+    // Unified unique symbol list for the grid rows
+    const symbols = symbolsFromData.length > 0 ? symbolsFromData : 
+                   (symbolsFromSubs.length > 0 ? symbolsFromSubs : symbolsFromSnap);
 
-    const symbols = Object.keys(data.data);
-    const slotLabels = data.slot_labels || [];
+    const slotLabels = data.slot_labels || TIME_SLOTS_25;
     const is25Min = slotLabels.length === 15;
     const activeSlots = is25Min ? TIME_SLOTS_25 : slotLabels;
     const slotCount = activeSlots.length;
+    const subscribedSet = new Set((subscriptions?.symbols || []).map(s => s.replace(/-EQ$/, '')));
+    const isLive = subscriptions?.connected ?? false;
 
-    const getPhases = () => {
-        if (is25Min) return PHASES_25(theme);
-        if (!data.phases || data.phases.length === 0) return [{ name: "Market Session", colSpan: slotCount, bg: "bg-indigo-500/10 text-indigo-500" }];
+    const phases = useMemo(() => {
+        if (!data.phases || data.phases.length === 0) {
+            return getDynamicPhases(activeSlots, theme);
+        }
 
-        // Check if phases are already formatted as {name, colSpan, bg}
         if (data.phases[0] && data.phases[0].colSpan !== undefined) {
             return data.phases;
         }
 
-        const phases = [];
+        const result = [];
         let currentPhase = null;
-        data.phases.forEach(slot => {
+        (data.phases || []).forEach(slot => {
             const phaseName = slot.phase || "Session";
             if (!currentPhase || currentPhase.name !== phaseName) {
                 currentPhase = { name: phaseName, colSpan: 1, bg: getPhaseColor(phaseName, theme) };
-                phases.push(currentPhase);
+                result.push(currentPhase);
             } else {
                 currentPhase.colSpan += 1;
             }
         });
-        return phases;
-    };
+        return result;
+    }, [data.phases, activeSlots, theme]);
 
     const getPhaseColor = (name, theme) => {
         if (!name) return theme === 'dark' ? "bg-slate-500/10 text-slate-400" : "bg-slate-50 text-slate-500";
@@ -191,15 +198,78 @@ const LiveFeedGrid = ({ data, theme }) => {
 
     if (symbols.length === 0) {
         return (
-            <div className="flex-1 flex flex-col items-center justify-center space-y-4 opacity-50">
+            <div className="flex-1 flex flex-col items-center justify-center p-12 opacity-50 space-y-4">
                 <AlertCircle size={48} className="text-gray-500" />
-                <p className="text-gray-500 font-bold uppercase tracking-widest text-xs">Waiting for market ticks...</p>
+                <h3 className={clsx("text-lg font-black uppercase tracking-widest", theme === 'dark' ? "text-gray-400" : "text-gray-600")}>
+                    No Watchlist Selected
+                </h3>
+                <p className={clsx("text-xs opacity-60", theme === 'dark' ? "text-gray-500" : "text-gray-400")}>
+                    Please select a collection to initialize the 24/7 Analytic Grid.
+                </p>
+            </div>
+        );
+    }
+
+    const isWaitingForData = symbols.length > 0 && symbolsFromData.length === 0 && isLive;
+    if (isWaitingForData) {
+        return (
+            <div className="flex-1 flex flex-col items-center justify-center p-12 space-y-4">
+                <Radio size={48} className="text-indigo-500 animate-pulse" />
+                <h3 className={clsx("text-lg font-black uppercase tracking-widest", theme === 'dark' ? "text-indigo-400" : "text-indigo-500")}>
+                    Synchronizing Feed Layout
+                </h3>
+                <p className={clsx("text-xs opacity-60", theme === 'dark' ? "text-gray-400" : "text-gray-500")}>
+                    Re-aggregating {symbols.length} symbols across {slotCount} unique time slots...
+                </p>
             </div>
         );
     }
 
     return (
         <div className="flex-1 overflow-auto p-4 scrollbar-hide">
+            {/* Connection Banner & Data Vitality Pulse */}
+            <div className={clsx(
+                "flex items-center justify-between px-5 py-3 rounded-2xl mb-4 border transition-all",
+                theme === 'dark' ? "bg-black/40 border-white/10" : "bg-gray-50 border-gray-200"
+            )}>
+                <div className="flex items-center space-x-3">
+                    <div className={clsx("size-2 rounded-full", isLive ? "bg-emerald-400 animate-pulse" : "bg-gray-500")} />
+                    <span className={clsx("text-[11px] font-black uppercase tracking-widest", theme === 'dark' ? "text-gray-300" : "text-gray-700")}>
+                        {isLive ? `Live Feed Active Engine — ${symbols.length} symbols streaming` : 'Snapshot Mode (No Live Feed)'}
+                    </span>
+                    {data.timestamp && (
+                        <div className={clsx(
+                            "flex items-center space-x-2 px-3 py-1 rounded-full border ml-4 shadow-sm transition-all duration-75",
+                            theme === 'dark' ? "bg-indigo-500/10 border-indigo-500/30" : "bg-indigo-50 border-indigo-200"
+                        )}>
+                            <Zap size={10} className="text-amber-500 animate-pulse" />
+                            <span className={clsx("text-[10px] font-mono font-black uppercase tracking-widest", theme === 'dark' ? "text-indigo-300" : "text-indigo-600")}>
+                                LAST SYNC: {data.timestamp}
+                            </span>
+                        </div>
+                    )}
+                </div>
+                {/* Right Side Refresh Indicator & Auth Status */}
+                <div className="flex items-center space-x-3">
+                    {data.authenticated === false && (
+                        <div className={clsx(
+                            "px-3 py-1 rounded-full text-[9px] font-black uppercase tracking-wider flex items-center space-x-2 border animate-pulse",
+                            theme === 'dark' ? "bg-rose-500/10 border-rose-500/30 text-rose-400" : "bg-rose-50 border-rose-200 text-rose-600"
+                        )}>
+                            <AlertCircle size={10} />
+                            <span>Broker Token Expired — Please Login</span>
+                        </div>
+                    )}
+                    <div className={clsx(
+                        "px-3 py-1 rounded-full text-[9px] font-black uppercase tracking-wider flex items-center space-x-2",
+                        theme === 'dark' ? "bg-white/5 text-gray-400" : "bg-gray-100 text-gray-500"
+                    )}>
+                        <span className="size-1.5 bg-emerald-500 rounded-full animate-ping"></span>
+                        <span>Auto-Refresh Active</span>
+                    </div>
+                </div>
+            </div>
+
             <div className={clsx(
                 "rounded-3xl border shadow-2xl overflow-hidden backdrop-blur-md transition-all",
                 theme === 'dark' ? "bg-black/40 border-white/5" : "bg-white border-gray-200"
@@ -216,7 +286,7 @@ const LiveFeedGrid = ({ data, theme }) => {
                                     <span className={clsx("text-[10px] font-black uppercase tracking-widest", theme === 'dark' ? "text-gray-400" : "text-gray-600")}>Instrument</span>
                                 </div>
                             </th>
-                            {getPhases().map((phase, i) => (
+                            {phases.map((phase, i) => (
                                 <th key={i} colSpan={phase.colSpan} className={clsx(
                                     "p-1.5 text-[10px] font-black uppercase tracking-[0.2em] border-b text-center border-l",
                                     phase.bg,
@@ -251,11 +321,12 @@ const LiveFeedGrid = ({ data, theme }) => {
                                         key={`${sym}-${m.label}`}
                                         symbol={sym}
                                         metric={m.label}
-                                        data={data.data[sym]}
+                                        data={data?.data?.[sym] || {}}
                                         isFirst={idx === 0}
                                         theme={theme}
                                         slotCount={slotCount}
-                                        dailySummary={data.daily_summary[sym]}
+                                        dailySummary={data?.daily_summary?.[sym]}
+                                        isSubscribed={subscribedSet.has(sym)}
                                     />
                                 ))}
                             </React.Fragment>

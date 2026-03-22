@@ -1,6 +1,6 @@
 from fastapi import APIRouter, Depends, HTTPException, UploadFile, File
 from sqlalchemy.ext.asyncio import AsyncSession
-from app.database import get_async_db
+from app.infrastructure.database import get_async_db
 from app.models.trade import TradeLog
 from app.core.analytics import TradeAnalytics
 from sqlalchemy import select

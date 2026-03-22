@@ -1,9 +1,9 @@
-import React from 'react';
+import React, { memo, useMemo } from 'react';
 import { clsx } from 'clsx';
 import { Download, CalendarDays } from 'lucide-react';
-import { METRIC_CONFIG, PHASES_25 } from '../constants';
+import { METRIC_CONFIG, PHASES_25, getDynamicPhases } from '../../../constants';
 
-const BacktestGridSymbolBlock = ({ symbol, dates, timeMap, dataObj, theme, unifiedTimes }) => {
+const BacktestGridSymbolBlock = memo(({ symbol, dates, timeMap, dataObj, theme, unifiedTimes }) => {
     const numMetrics = METRIC_CONFIG.length;
     const rows = [];
     dates.forEach((dateStr, dateIdx) => {
@@ -123,8 +123,8 @@ const BacktestGridSymbolBlock = ({ symbol, dates, timeMap, dataObj, theme, unifi
                                 isVS && val < 50 && "text-gray-600 opacity-50",
                                 sentimentBg,
                                 // Range Markers
-                                isPrice && val !== undefined && val === dayHigh && "ring-2 ring-blue-500 ring-inset z-10",
-                                isPrice && val !== undefined && val === dayLow && "ring-2 ring-rose-700 ring-inset z-10",
+                                isPrice && val !== undefined && val !== null && val === dayHigh && "ring-2 ring-blue-500 ring-inset z-10",
+                                isPrice && val !== undefined && val !== null && val === dayLow && "ring-2 ring-rose-700 ring-inset z-10",
                                 theme === 'dark' ? "border-white/10" : "border-gray-200"
                             )}>
                                 {val !== undefined && val !== null ? (
@@ -161,7 +161,7 @@ const BacktestGridSymbolBlock = ({ symbol, dates, timeMap, dataObj, theme, unifi
     });
 
     return <>{rows}</>;
-};
+});
 
 const BacktestGrid = ({ data, theme }) => {
     if (!data || !data.data) return null;
@@ -169,28 +169,31 @@ const BacktestGrid = ({ data, theme }) => {
     const symbols = Object.keys(data.data);
     const rawLabels = data.slot_labels || [];
     
-    const uniqueTimesSet = new Set();
-    const timeMap = {}; // timeMap[dateKey][timeKey] = idx
+    const { unifiedTimes, dates, timeMap } = useMemo(() => {
+        const uniqueTimesSet = new Set();
+        const tMap = {}; // timeMap[dateKey][timeKey] = idx
 
-    rawLabels.forEach((lbl, idx) => {
-        const parts = lbl.split(' ');
-        const dateKey = parts.length >= 3 ? `${parts[0]} ${parts[1]}` : 'Unknown';
-        const timeKey = parts.length >= 3 ? parts[2] : lbl;
-        
-        uniqueTimesSet.add(timeKey);
-        
-        if (!timeMap[dateKey]) timeMap[dateKey] = {};
-        timeMap[dateKey][timeKey] = idx;
-    });
+        rawLabels.forEach((lbl, idx) => {
+            const parts = lbl.split(' ');
+            const dateKey = parts.length >= 2 ? parts[0] : 'Unknown';
+            const timeKey = parts.length >= 2 ? parts[1] : lbl;
+            
+            uniqueTimesSet.add(timeKey);
+            
+            if (!tMap[dateKey]) tMap[dateKey] = {};
+            tMap[dateKey][timeKey] = idx;
+        });
 
-    const unifiedTimes = Array.from(uniqueTimesSet).sort();
-    const dates = Object.keys(timeMap);
+        return {
+            unifiedTimes: Array.from(uniqueTimesSet).sort(),
+            dates: Object.keys(tMap),
+            timeMap: tMap
+        };
+    }, [rawLabels]);
 
-    const is25Min = unifiedTimes.length === 15;
-    const getPhases = () => {
-        if (is25Min) return PHASES_25(theme);
-        return [{ name: "Market Session", colSpan: unifiedTimes.length, bg: theme === 'dark' ? "bg-indigo-500/10 text-indigo-500" : "bg-indigo-50 text-indigo-600" }];
-    };
+    const phases = useMemo(() => {
+        return getDynamicPhases(unifiedTimes, theme);
+    }, [unifiedTimes, theme]);
 
     const downloadCSV = () => {
         let csv = 'Date,Time,Symbol,Price,INR,PC %,Volume,VS %\n';
@@ -246,7 +249,7 @@ const BacktestGrid = ({ data, theme }) => {
                             )}>
                                 <span className={clsx("text-[9px] font-black uppercase tracking-widest opacity-60", theme === 'dark' ? "text-gray-400" : "text-gray-600")}>Time Phases</span>
                             </th>
-                            {getPhases().map((phase, i) => (
+                            {phases.map((phase, i) => (
                                 <th key={i} colSpan={phase.colSpan} className={clsx(
                                     "p-1.5 text-[10px] font-black uppercase tracking-[0.2em] border-b text-center border-l sticky top-0 z-30",
                                     phase.bg,

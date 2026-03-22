@@ -1,4 +1,4 @@
-from datetime import datetime, time
+from datetime import datetime, time, timedelta
 from typing import Tuple
 from app.constants import NSE_HOLIDAYS_2026
 
@@ -9,25 +9,29 @@ class MarketCalendar:
     
     @staticmethod
     def get_market_status(target_dt: datetime = None) -> Tuple[str, str]:
-        """Returns the current trading status and reason."""
-        now = target_dt or datetime.now()
-        today_str = now.strftime("%Y-%m-%d")
+        """Returns the current trading status and reason (IST)."""
+        # Force IST (+5:30)
+        now_utc = target_dt or datetime.utcnow()
+        now_ist = now_utc + timedelta(hours=5, minutes=30) if not target_dt else now_utc
         
+        today_str = now_ist.strftime("%Y-%m-%d")
+        curr_time = now_ist.time()
+
         # Check Weekend
-        if now.weekday() >= 5: # Sat=5, Sun=6
+        if now_ist.weekday() >= 5:
             return "CLOSED", "Weekend"
         
         # Check Holiday
         if today_str in NSE_HOLIDAYS_2026:
             return "CLOSED", "Market Holiday"
             
-        # Check Hours
-        m_start = now.replace(hour=9, minute=15, second=0, microsecond=0)
-        m_end = now.replace(hour=15, minute=30, second=0, microsecond=0)
+        # Check Hours (09:15 to 15:30 IST)
+        m_start = time(9, 15)
+        m_end = time(15, 30)
         
-        if now < m_start:
+        if curr_time < m_start:
             return "CLOSED", "Pre-Market"
-        if now > m_end:
+        if curr_time > m_end:
             return "CLOSED", "Post-Market"
             
         return "OPEN", "Live Trading"

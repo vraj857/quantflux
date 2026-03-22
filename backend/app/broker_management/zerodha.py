@@ -1,4 +1,4 @@
-import logging
+from app.infrastructure.logging import ql_logger as logging
 import asyncio
 from typing import List, Dict, Any, Optional
 from datetime import datetime
@@ -113,6 +113,10 @@ class ZerodhaAdapter(IBroker):
     async def validate_token(self) -> bool:
         try:
             profile = await self.get_profile()
-            return bool(profile and profile.get("client_id"))
-        except Exception:
+            is_valid = bool(profile and profile.get("client_id"))
+            if not is_valid:
+                logging.warning(f"Zerodha token validation failed: Profile returned {profile}")
+            return is_valid
+        except Exception as e:
+            logging.error(f"Zerodha token validation exception: {e}")
             return False

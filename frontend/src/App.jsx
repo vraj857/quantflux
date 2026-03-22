@@ -1,16 +1,23 @@
+/**
+ * QuantFlux Enterprise Web Application
+ * Version: 2.5.0
+ * Author: Senior Architect
+ * Description: Main application shell orchestrating global state, view routing, 
+ *              and real-time broker connectivity.
+ */
 import React, { useState, useEffect } from 'react';
-import Sidebar from './components/Sidebar';
-import LiveFeedGrid from './components/LiveFeedGrid';
-import BacktestView from './components/BacktestView';
-import SettingsView from './components/SettingsView';
-import PhaseSimulatorView from './components/PhaseSimulatorView';
-import OrderConsole from './components/OrderConsole';
-import BrokerLoginGate from './components/BrokerLoginGate';
+import Sidebar from './components/layout/Sidebar';
+import LiveFeedGrid from './components/features/live-feed/LiveFeedGrid';
+import BacktestView from './components/features/backtest/BacktestView';
+import SettingsView from './components/features/settings/SettingsView';
+import PhaseSimulatorView from './components/features/simulator/PhaseSimulatorView';
+import OrderConsole from './components/features/analytics/OrderConsole';
+import BrokerLoginGate from './components/layout/BrokerLoginGate';
 import { useMarketData } from './hooks/useMarketData';
 import { Monitor, History, LayoutDashboard, Zap, ShieldCheck, Settings as SettingsIcon, Play, Target } from 'lucide-react';
 
 import { clsx } from 'clsx';
-import { api } from './services/api';
+import { api } from './api';
 
 const App = () => {
     // Session state — null means "not authenticated"
@@ -37,10 +44,21 @@ const App = () => {
     const [logs, setLogs] = useState([]);
     const [isSidebarCollapsed, setIsSidebarCollapsed] = useState(false);
     const [notification, setNotification] = useState(null);
-    const [selectedTimeframe, setSelectedTimeframe] = useState(25);
-    const [watchlistCollections, setWatchlistCollections] = useState(['Default']);
-    const [activeWatchlist, setActiveWatchlist] = useState('Default');
+    const [selectedTimeframe, setSelectedTimeframe] = useState(() => {
+        const stored = localStorage.getItem('DASHBOARD_TIMEFRAME');
+        return stored ? parseInt(stored) : 25;
+    });
+    const [watchlistCollections, setWatchlistCollections] = useState(() => {
+        const stored = localStorage.getItem('DASHBOARD_WATCHLIST');
+        return stored ? Array.from(new Set(['Default', stored])) : ['Default'];
+    });
+    const [activeWatchlist, setActiveWatchlist] = useState(() => {
+        const stored = localStorage.getItem('DASHBOARD_WATCHLIST');
+        return stored || 'Default';
+    });
     const [brokerProfile, setBrokerProfile] = useState(null);
+    const [snapshot, setSnapshot] = useState(null);
+    const [subscriptions, setSubscriptions] = useState(null);
     const { marketData, status } = useMarketData();
 
     // ── On mount: check if backend has an active session ──
@@ -85,8 +103,15 @@ const App = () => {
 
         const fetchConfig = async () => {
             try {
-                const data = await api.getTimeframe();
-                if (data.interval_minutes) setSelectedTimeframe(data.interval_minutes);
+                const stored = localStorage.getItem('DASHBOARD_TIMEFRAME');
+                if (stored) {
+                    const mins = parseInt(stored, 10);
+                    setSelectedTimeframe(mins);
+                    await api.setTimeframe(mins); // Enforce frontend preference on backend
+                } else {
+                    const data = await api.getTimeframe();
+                    if (data.interval_minutes) setSelectedTimeframe(data.interval_minutes);
+                }
             } catch (e) {}
         };
 
@@ -101,7 +126,9 @@ const App = () => {
             try {
                 const data = await api.getProfile();
                 if (data.authenticated) setBrokerProfile(data);
-            } catch (e) {}
+            } catch (e) {
+                console.error('Core profile fetch failed:', e);
+            }
         };
 
         checkSession();
@@ -109,6 +136,13 @@ const App = () => {
         fetchWatchlistNames();
         fetchProfile();
     }, []);
+
+    // ── Auto-sync persisted watchlist on startup ──
+    useEffect(() => {
+        if (session && activeWatchlist) {
+            handleWatchlistChange(activeWatchlist);
+        }
+    }, [!!session]); // Triggered once session is ready
 
     // ── Periodic updates (only when authenticated) ──
     useEffect(() => {
@@ -146,27 +180,73 @@ const App = () => {
 
     const handleTimeframeChange = async (minutes) => {
         try {
-            await api.setTimeframe(minutes);
             setSelectedTimeframe(minutes);
-            setNotification({ message: `Aggregation Timeframe updated to ${minutes} mins. Syncing slots...`, type: 'success' });
-            setTimeout(() => setNotification(null), 3000);
+            localStorage.setItem('DASHBOARD_TIMEFRAME', minutes);
+            await api.setTimeframe(minutes);
+            
+            // Re-sync the core sequence to backfill the newly structured aggregated slots
+            if (activeWatchlist && session) {
+                handleWatchlistChange(activeWatchlist);
+            } else {
+                setNotification({ message: `Aggregation Timeframe updated to ${minutes} mins. Syncing slots...`, type: 'success' });
+                setTimeout(() => setNotification(null), 3000);
+            }
         } catch (err) {}
     };
 
     const handleWatchlistChange = async (name) => {
         setActiveWatchlist(name);
+        localStorage.setItem('DASHBOARD_WATCHLIST', name);
         try {
-            const res = await fetch(`http://127.0.0.1:8000/api/watchlist/?name=${name}`);
-            const symbols = await res.json();
-            await fetch('http://127.0.0.1:8000/api/market/update-watchlist', {
-                method: 'POST',
-                headers: { 'Content-Type': 'application/json' },
-                body: JSON.stringify({ watchlist_name: name, symbols })
-            });
+            const symbols = await api.getWatchlist(name);
+            await api.syncWatchlist(symbols);
+            
+            // Immediate data refresh so the UI updates the count and data grid instantly
+            const [snap, subs] = await Promise.all([
+                api.getSnapshot(name),
+                api.getSubscriptions()
+            ]);
+            setSnapshot(snap);
+            setSubscriptions(subs);
+
             setNotification({ message: `Watchlist switched to "${name}" (${symbols.length} symbols)`, type: 'success' });
             setTimeout(() => setNotification(null), 3000);
-        } catch (err) {}
+        } catch (err) {
+            console.error('Failed to sync watchlist:', err);
+            setNotification({ message: `Sync failed: ${err.message}`, type: 'error' });
+            setTimeout(() => setNotification(null), 3000);
+        }
     };
+
+    // ── Auto-subscribe on first login ──
+    useEffect(() => {
+        if (session && activeWatchlist && activeView === 'live' && !marketData.timestamp) {
+            handleWatchlistChange(activeWatchlist);
+        }
+    }, [session, activeWatchlist, activeView]);
+
+    // ── Load snapshot + subscription status when on live view ──
+    useEffect(() => {
+        if (!session || activeView !== 'live') return;
+
+        const loadLiveViewData = async () => {
+            try {
+                const [snap, subs] = await Promise.all([
+                    api.getSnapshot(activeWatchlist),
+                    api.getSubscriptions()
+                ]);
+                setSnapshot(snap);
+                setSubscriptions(subs);
+            } catch (e) {
+                console.warn('Could not load snapshot/subscriptions:', e);
+            }
+        };
+
+        loadLiveViewData();
+        // Refresh every 30s to keep subscription status current
+        const interval = setInterval(loadLiveViewData, 30000);
+        return () => clearInterval(interval);
+    }, [session, activeView, activeWatchlist]);
 
     const toggleTheme = () => setTheme(prev => prev === 'dark' ? 'light' : 'dark');
     const toggleSidebar = () => setIsSidebarCollapsed(prev => !prev);
@@ -352,12 +432,12 @@ const App = () => {
                         </div>
 
                         {/* The highly performant grid */}
-                        <LiveFeedGrid data={marketData} theme={theme} />
+                        <LiveFeedGrid data={marketData} snapshot={snapshot} subscriptions={subscriptions} theme={theme} />
                     </div>
                 )}
 
                 <div className={clsx("flex-1 overflow-auto", activeView === 'backtest' ? "flex flex-col" : "hidden")}>
-                    <BacktestView theme={theme} />
+                    <BacktestView theme={theme} activeView={activeView} />
                 </div>
                 {activeView === 'simulator' && <PhaseSimulatorView theme={theme} />}
                 {activeView === 'orders' && <OrderConsole theme={theme} />}

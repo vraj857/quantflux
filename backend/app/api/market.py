@@ -1,6 +1,6 @@
 from fastapi import APIRouter, Depends, HTTPException, Query, WebSocket, WebSocketDisconnect
 from sqlalchemy.ext.asyncio import AsyncSession
-from app.database import get_async_db
+from app.infrastructure.database import get_async_db
 from app.state import state
 from app.core.calendar import MarketCalendar
 from datetime import datetime
@@ -91,12 +91,13 @@ async def get_historical_ohlc(symbol: str, start_date: str, end_date: str, timef
         dt = datetime.fromtimestamp(c["timestamp"])
             
         m_start = dt.replace(hour=9, minute=15, second=0, microsecond=0)
-        if dt < m_start: continue
+        m_end = dt.replace(hour=15, minute=30, second=0, microsecond=0)
+        if dt < m_start or dt >= m_end: continue
         
         diff_minutes = (dt - m_start).total_seconds() / 60
         slot_idx = int(diff_minutes // timeframe)
         slot_start_time = m_start + timedelta(minutes=slot_idx * timeframe)
-        label = slot_start_time.strftime("%d %b %H:%M")
+        label = slot_start_time.strftime("%d-%m-%Y %H:%M")
         
         if not current_slot or current_slot["label"] != label:
             if current_slot: aggregated_slots.append(current_slot)
@@ -202,7 +203,8 @@ async def bulk_phase_scan(data: dict):
                     dt = datetime.fromtimestamp(int(dt)) if isinstance(dt, (int, str)) else dt
                 
                 m_start = dt.replace(hour=9, minute=15, second=0, microsecond=0)
-                if dt < m_start: continue
+                m_end = dt.replace(hour=15, minute=30, second=0, microsecond=0)
+                if dt < m_start or dt >= m_end: continue
                 
                 # 25-min slots for consistency with dashboard
                 slot_idx = int(((dt - m_start).total_seconds() / 60) // 25)
@@ -328,12 +330,123 @@ async def get_system_logs():
 
 @router.post("/update-watchlist")
 async def update_watchlist(data: dict):
-    """Triggers the active broker to re-subscribe to current symbols."""
+    """Triggers the active broker to re-subscribe to current symbols with historical backfill."""
     if not state.active_broker:
         return {"status": "error", "message": "No active broker"}
     
     symbols = data.get("symbols", [])
-    if symbols:
+    if not symbols:
+        return {"status": "success", "synced": 0}
+
+    # --- Live Backfill Logic ---
+    # Fetch today's 1m data from 09:15 AM to NOW for each symbol
+    from app.core.calendar import MarketCalendar
+    from datetime import datetime, time
+    import pytz
+    
+    ist = pytz.timezone('Asia/Kolkata')
+    now_ist = datetime.now(ist)
+    market_open = now_ist.replace(hour=9, minute=15, second=0, microsecond=0)
+    
+    # Pre-initialize the grid structure to ensure immediate render in UI
+    state.aggregator.initialize_symbols(symbols)
+    state._needs_broadcast = True
+    # --- Session Lifecycle Management ---
+    # 1. Clean Slate: If it's pre-market AM, ensure aggregator is cleared of yesterday's data
+    if now_ist.time() < time(9, 15):
+        logging.info("Market API: Pre-market hour detected. Clearing old session data for a clean slate.")
+        state.aggregator.reset_live_state()
+        state.aggregator.session_date = now_ist.date()
+
+    # 2. Backfill: Only backfill if we are past market open today (or showing last session)
+    if now_ist.time() >= time(9, 15):
+        # Determine backfill end-time: if market is closed, go to 15:30, otherwise NOW
+        backfill_end = now_ist
+        if now_ist.time() > time(15, 30):
+            backfill_end = now_ist.replace(hour=15, minute=30, second=0, microsecond=0)
+            
+        start_date = market_open.strftime("%Y-%m-%d %H:%M:%S")
+        end_date = backfill_end.strftime("%Y-%m-%d %H:%M:%S")
+        interval = "1" if state.active_broker_name == "FYERS" else "minute"
+        
+        # Diagnostic Trace Bridge
+        with open(r"c:\tmp\backfill_trace.txt", "a") as f:
+            f.write(f"\n[{datetime.now()}] Performing Live Backfill for {len(symbols)} symbols from {start_date} to {end_date}\n")
+            for sym in symbols:
+                try:
+                    candles = await state.active_broker.fetch_history(sym, interval, start_date, end_date)
+                    if candles:
+                        f.write(f"[{datetime.now()}] SUCCESS: Backfilled {len(candles)} candles for {sym}\n")
+                        await state.aggregator.replay_candles(sym, candles)
+                    else:
+                        f.write(f"[{datetime.now()}] WARNING: No data for {sym}\n")
+                except Exception as e:
+                    f.write(f"[{datetime.now()}] ERROR: {sym} failed: {e}\n")
+                    logging.error(f"Backfill failed for {sym}: {e}")
+            f.flush()
+
+    # Start the live ticker after backfill (only if market is open/near-open)
+    if now_ist.time() < time(15, 35): # Buffer for session close
         from app.main import on_tick_received
         await state.active_broker.start_ticker(symbols, on_tick_received)
-    return {"status": "success", "synced": len(symbols)}
+    
+    return {"status": "success", "synced": len(symbols), "backfilled": now_ist.time() >= time(9, 15)}
+
+@router.get("/subscriptions")
+async def get_subscriptions():
+    """
+    Returns the list of symbols currently subscribed to the live WebSocket feed,
+    plus the WS connection status.
+    """
+    if not state.active_broker:
+        return {"connected": False, "symbols": [], "broker": None}
+    
+    broker = state.active_broker
+    subscribed = broker.get_subscribed_symbols() if hasattr(broker, "get_subscribed_symbols") else []
+    connected = getattr(broker, "ws_connected", False)
+    
+    return {
+        "connected": connected,
+        "symbols": subscribed,
+        "broker": state.active_broker_name
+    }
+
+@router.get("/snapshot")
+async def get_market_snapshot(watchlist: str = "Default", db: AsyncSession = Depends(get_async_db)):
+    """
+    Fetches today's OHLCV + LTP for all symbols in the given watchlist via the
+    broker's REST quotes endpoint. Works 24/7 — returns last session data even
+    after market close, providing the table data quant traders expect to see immediately.
+    """
+    if not state.active_broker:
+        raise HTTPException(status_code=400, detail="No active broker session")
+    
+    if not hasattr(state.active_broker, "get_quotes"):
+        raise HTTPException(status_code=501, detail="Current broker does not support quotes snapshot")
+    
+    from app.api.watchlist import get_watchlist_symbols
+    symbols = await get_watchlist_symbols(watchlist, db)
+    
+    if not symbols:
+        return {"status": "ok", "watchlist": watchlist, "quotes": []}
+    
+    # Fyers batch limit is 50 symbols per request
+    BATCH = 50
+    all_quotes = []
+    for i in range(0, len(symbols), BATCH):
+        batch = symbols[i:i + BATCH]
+        quotes = await state.active_broker.get_quotes(batch)
+        all_quotes.extend(quotes)
+    
+    return {
+        "status": "ok",
+        "watchlist": watchlist,
+        "market_status": MarketCalendar.get_market_status()[0],
+        "quotes": all_quotes
+    }
+
+@router.get("/full-state")
+async def get_full_state():
+    """Returns the consolidated live market state for polling fallbacks."""
+    return state.aggregator.get_full_market_state()
+

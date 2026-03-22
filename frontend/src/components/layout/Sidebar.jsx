@@ -11,7 +11,7 @@ import {
     LogOut
 } from 'lucide-react';
 import { clsx } from 'clsx';
-import { MENU_ITEMS } from '../constants';
+import { MENU_ITEMS } from '../../constants';
 
 const Sidebar = ({
     activeView,

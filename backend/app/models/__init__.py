@@ -1,4 +1,4 @@
-from app.database import Base
+from app.infrastructure.database import Base
 from app.models.instrument import Instrument
 from app.models.session import BrokerSession
 from app.models.trade import TradeLog

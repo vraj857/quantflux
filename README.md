@@ -33,8 +33,12 @@ A React-based dashboard optimized for speed.
 - **Tiered Logging**: Separated system and broker traffic logs for easier debugging.
 
 ## Setup
-1. **Backend**: `python -m uvicorn app.main:app --host 127.0.0.1 --port 8000 --reload`
-2. **Frontend**: `npm run dev -- --host 127.0.0.1`
+### Recommended (Windows)
+Double-click `run_quantflux.bat` from the root directory — it opens both the Backend and Frontend in separate CMD windows.
+
+### Manual
+1. **Backend**: `cd backend && python -m uvicorn app.main:app --reload`
+2. **Frontend**: `cd frontend && npm run dev`
 
 ---
 *Access the platform at http://127.0.0.1:3000*

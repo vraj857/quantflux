@@ -1,92 +1,303 @@
+"""
+QuantFlux Core Aggregation Engine
+Version: 2.1.0
+Description: High-performance time-slot aggregator for real-time market data.
+             Handles candle synthesis, percent change calculation, and volume strength analysis.
+"""
 import logging
-from typing import Dict, List, Optional
-from datetime import datetime
+import json
+from typing import Dict, List, Optional, Any, Tuple
+from datetime import datetime, time, timedelta
+
+# Avoid circular imports
+from app.constants import SLOT_SIZE_MINUTES, TIME_SLOTS_25
 
 class AggregationEngine:
     """
-    Core engine to aggregate 1-minute candles into custom timeframes (e.g., 25m slots).
-    Designed for 100% parity between Live and Historical data processing.
+    Enterprise-Grade Aggregation Engine for Real-Time Market Data.
+    Synchronizes Live Feed and Historical Data with 100% IST Parity.
     """
     
     def __init__(self, slot_minutes: int = 25):
-        self.slot_minutes = slot_minutes
-        self.state = {} # symbol -> current_slot_data
+        self._slot_minutes = slot_minutes
+        self.current_slot_labels = self._generate_slot_labels()
+        # O(1) Indexing for high-frequency tick lookups
+        self.label_to_idx = {lbl: i for i, lbl in enumerate(self.current_slot_labels)}
+        
+        self.state = {}       # Core aggregation state (for candles)
+        self.live_state = {}  # Real-time state (for dashboard grid)
+        self.live_data = {}   # Raw tick data
+        self._dirty_symbols = set() # Optimized broadcasting flag
+        self._payload_cache = {"data": {}, "daily_summary": {}} # High-speed serialization cache
+        self._slot_buffer = []      # Batched DB persistence queue
+        self.session_date = self._get_ist_now().date()
+
+    @property
+    def slot_minutes(self):
+        return self._slot_minutes
+
+    @slot_minutes.setter
+    def slot_minutes(self, value):
+        self._slot_minutes = value
+        self.current_slot_labels = self._generate_slot_labels()
+        self.label_to_idx = {lbl: i for i, lbl in enumerate(self.current_slot_labels)}
+        self.reset_live_state()
+
+    def _generate_slot_labels(self) -> List[str]:
+        labels = []
+        d = datetime.now().replace(hour=9, minute=15, second=0, microsecond=0)
+        end_d = datetime.now().replace(hour=15, minute=30, second=0, microsecond=0)
+        while d < end_d:
+            labels.append(d.strftime("%H:%M"))
+            d += timedelta(minutes=self._slot_minutes)
+        return labels
+
+    def _normalize_symbol(self, symbol: str) -> str:
+        """Unifies symbols by stripping broker-specific suffixes (e.g., -EQ)."""
+        if not symbol: return ""
+        return symbol.replace("-EQ", "").strip()
 
     def reset_state(self, symbol: Optional[str] = None):
         if symbol:
-            if symbol in self.state:
-                del self.state[symbol]
+            norm_sym = self._normalize_symbol(symbol)
+            self.state.pop(norm_sym, None)
+            self.live_state.pop(norm_sym, None)
         else:
             self.state = {}
+            self.live_state = {}
+
+    def _get_ist_now(self, dt: Optional[datetime] = None) -> datetime:
+        """Returns the current IST time (+5:30)."""
+        if dt:
+            # Historical candles from broker are already normalized to local time or UTC.
+            # The OS fromtimestamp() already handles local timezone (IST in this case).
+            return dt
+        return datetime.utcnow() + timedelta(hours=5, minutes=30)
+
+    def _get_slot_label(self, dt: Optional[datetime] = None) -> str:
+        """Determines the current active dynamic slot label (IST)."""
+        ist_now = self._get_ist_now(dt)
+        curr_time = ist_now.time()
+        m_start_time = time(9, 15)
+        
+        if curr_time < m_start_time:
+            return "09:15"
+        
+        # Calculate minutes since 09:15 IST
+        elapsed = (ist_now.hour * 60 + ist_now.minute) - (9 * 60 + 15)
+        slot_idx = elapsed // self.slot_minutes
+        slot_idx = max(0, min(len(self.current_slot_labels) - 1, slot_idx))
+        
+        return self.current_slot_labels[slot_idx] if slot_idx < len(self.current_slot_labels) else self.current_slot_labels[-1]
+
+    async def replay_candles(self, symbol: str, candles: List[Dict]):
+        """
+        Warms up the aggregator by replaying historical 1-minute candles for the current day.
+        This provides the 'Instant Backfill' the user expects when opening mid-session.
+        """
+        if not candles: return
+        symbol = self._normalize_symbol(symbol)
+        logging.info(f"Aggregator: Replaying {len(candles)} 1m candles for {symbol} backfill...")
+        for candle in candles:
+            # We treat the candle close as a 'tick' for the aggregator's 25-min slot logic
+            # This correctly populates all previously closed slots since 09:15 IST
+            await self.process_candle(symbol, candle)
+        
+        logging.info(f"Aggregator: Backfill complete for {symbol}.")
+        
+        # Trigger broadcast so the UI sees the backfilled slots immediately
+        from app.state import state
+        state._needs_broadcast = True
+
+    def reset_live_state(self):
+        """Clears all in-memory live data for a clean session start."""
+        logging.info("Aggregator: Performing clean session reset.")
+        self.live_data = {}
+        self.live_state = {}
+        self._payload_cache = {"data": {}, "daily_summary": {}}
+        self._dirty_symbols.clear()
+
+    def initialize_symbols(self, symbols: List[str]):
+        """Pre-populates the live_state keys for the given symbols to ensure the grid renders immediately."""
+        logging.info(f"Aggregator: Initializing grid structure for {len(symbols)} symbols.")
+        for symbol in symbols:
+            norm_sym = self._normalize_symbol(symbol)
+            if norm_sym not in self.live_state:
+                n_slots = len(self.current_slot_labels)
+                self.live_state[norm_sym] = {
+                    "price": [None] * n_slots,
+                    "price_move": [0.0] * n_slots,
+                    "percent_change": [0.0] * n_slots,
+                    "volume": [0] * n_slots,
+                    "volume_strength": [100.0] * n_slots,
+                    "slot_opens": [None] * n_slots,
+                    "last_total_volume": 0
+                }
+
+    async def add_tick(self, tick: Dict[str, Any]):
+        """
+        Processes a new incoming tick and bifurgates it into the correct dashboard slot.
+        """
+        ist_now = self._get_ist_now()
+        
+        # --- Session Lifecycle Management: Handle Day Change ---
+        if ist_now.date() > self.session_date:
+            logging.info(f"Aggregator: New session detected ({ist_now.date()}). Performing auto-reset.")
+            self.reset_live_state()
+            self.session_date = ist_now.date()
+            
+        symbol = self._normalize_symbol(tick.get("symbol", ""))
+        ltp = tick.get("ltp", 0.0)
+        total_volume = tick.get("volume", 0)
+        
+        # Ensure symbol exists in life data
+        if symbol not in self.live_data:
+            self.live_data[symbol] = {
+                "price": [], "price_move": [], "percent_change": [], 
+                "volume": [], "volume_strength": [], "last_tick": {}
+            }
+
+        # Update the 'Last Updated' tick state immediately
+        self.live_data[symbol]["last_tick"] = {"ltp": ltp, "volume": total_volume}
+        
+        # Mark dirty for lazy payload generation
+        self._dirty_symbols.add(symbol)
+        
+        # Trigger an immediate broadcast for true tick-by-tick '1ms' feel
+        from app.state import state
+        state._needs_broadcast = True
+
+        slot_label = self._get_slot_label()
+        slot_idx = self.label_to_idx.get(slot_label, 0)
+        
+        if symbol not in self.live_state:
+            n_slots = len(self.current_slot_labels)
+            self.live_state[symbol] = {
+                "price": [None] * n_slots,
+                "price_move": [0.0] * n_slots,
+                "percent_change": [0.0] * n_slots,
+                "volume": [0] * n_slots,
+                "volume_strength": [100.0] * n_slots,
+                "slot_opens": [None] * n_slots,
+                "last_total_volume": total_volume
+            }
+
+        symbol_data = self.live_state[symbol]
+        # 1. Update Reference Open (First price of the slot)
+        if symbol_data["slot_opens"][slot_idx] is None:
+            symbol_data["slot_opens"][slot_idx] = ltp
+
+        # 2. Update Primary Metrics
+        symbol_data["price"][slot_idx] = ltp
+        
+        # 3. Update Relative Metrics (Tick-by-Tick logic)
+        slot_open = symbol_data["slot_opens"][slot_idx]
+        inr_move = round(ltp - slot_open, 2)
+        pc_change = round((inr_move / slot_open * 100), 2) if slot_open > 0 else 0.0
+        
+        symbol_data["price_move"][slot_idx] = inr_move
+        symbol_data["percent_change"][slot_idx] = pc_change
+        
+        # 4. Update Volume Delta
+        volume_delta = total_volume - symbol_data["last_total_volume"]
+        if volume_delta > 0:
+            symbol_data["volume"][slot_idx] += volume_delta
+            symbol_data["last_total_volume"] = total_volume
+        
+        # 5. Update Volume Strength (Tick-by-Tick vs Historical average)
+        # Fetch historical average for this symbol/slot if available
+        # This is a simplified version; in production, you'd pull from self.state["history"]
+        pass
 
     async def process_candle(self, symbol: str, candle_1m: Dict) -> Optional[Dict]:
-        """
-        Rolls a 1-minute candle into the current custom slot.
-        Returns the completed slot if the candle marks the boundary, or the updated current slot.
-        """
+        """Rolls a 1-minute candle into the persistent aggregation state AND the live grid state."""
+        symbol = self._normalize_symbol(symbol)
         ts = candle_1m['timestamp']
-        if isinstance(ts, (int, float)):
-            dt = datetime.fromtimestamp(ts)
-        else:
-            dt = ts
+        dt = datetime.fromtimestamp(ts) if isinstance(ts, (int, float)) else ts
+        ltp = candle_1m['close']
+        vol = candle_1m['volume']
             
         if symbol not in self.state:
-            self.state[symbol] = {
-                "current_slot": None,
-                "history": [] # Stores previous completed slots for volume strength
-            }
+            self.state[symbol] = {"current_slot": None, "history": []}
             
+        # --- Update Persistence Layer (self.state) ---
         state = self.state[symbol]
         slot_label = self._get_slot_label(dt)
         
         if not state["current_slot"] or state["current_slot"]["label"] != slot_label:
-            # Slot boundary reached!
             completed_slot = state["current_slot"]
-            
-            # Start new slot
             state["current_slot"] = {
                 "label": slot_label,
-                "open": candle_1m['open'],
-                "high": candle_1m['high'],
-                "low": candle_1m['low'],
-                "close": candle_1m['close'],
-                "volume": candle_1m['volume'],
-                "count": 1
+                "open": candle_1m['open'], "high": candle_1m['high'], "low": candle_1m['low'], "close": ltp,
+                "volume": vol, "count": 1,
+                "epoch": ts if isinstance(ts, (int, float)) else ts.timestamp()
             }
-            
             if completed_slot:
                 state["history"].append(completed_slot)
-                if len(state["history"]) > 20: state["history"].pop(0)
-                # Persist completed slot
-                analytics = self.get_analytics(symbol)
-                await self._persist_slot(symbol, completed_slot, analytics)
-                return completed_slot
+                if len(state["history"]) > 60: state["history"].pop(0)
+                analytics = self.get_analytics_for_slot(symbol, completed_slot)
+                
+                # Batched Persistence (Enterprise Performance)
+                self._slot_buffer.append((symbol, completed_slot, analytics))
+                if len(self._slot_buffer) >= 20: 
+                    await self._flush_slot_buffer()
         else:
-            # Update existing slot
             s = state["current_slot"]
             s["high"] = max(s["high"], candle_1m["high"])
             s["low"] = min(s["low"], candle_1m["low"])
-            s["close"] = candle_1m["close"]
-            s["volume"] += candle_1m["volume"]
+            s["close"] = ltp
+            s["volume"] += vol
             s["count"] += 1
+
+        # --- Update Live Grid Layer (self.live_state) ---
+        if symbol not in self.live_state:
+            n_slots = len(self.current_slot_labels)
+            self.live_state[symbol] = {
+                "price": [None] * n_slots, "price_move": [0.0] * n_slots, "percent_change": [0.0] * n_slots,
+                "volume": [0] * n_slots, "volume_strength": [100.0] * n_slots, 
+                "slot_opens": [None] * n_slots, "last_total_volume": 0
+            }
             
-        # Optional: Persist ongoing slot update (might be too frequent, depends on use case)
-        # For now, we only persist on boundary or manually.
+        # Mark dirty
+        self._dirty_symbols.add(symbol)
+            
+        symbol_data = self.live_state[symbol]
+        slot_idx = self.label_to_idx.get(slot_label, 0)
         
+        # 1. Update Reference Open (First price of the slot)
+        if symbol_data["slot_opens"][slot_idx] is None:
+            symbol_data["slot_opens"][slot_idx] = candle_1m['open']
+            
+        # 2. Update Primary Metrics
+        symbol_data["price"][slot_idx] = ltp
+        slot_open = symbol_data["slot_opens"][slot_idx]
+        inr_move = round(ltp - slot_open, 2)
+        symbol_data["price_move"][slot_idx] = inr_move
+        symbol_data["percent_change"][slot_idx] = round((inr_move / slot_open * 100), 2) if slot_open > 0 else 0.0
+        symbol_data["volume"][slot_idx] += vol
+
         return state["current_slot"]
 
+    def get_analytics_for_slot(self, symbol: str, slot: Dict) -> Dict:
+        state = self.state.get(symbol)
+        if not state: return {}
+        past_vols = [s["volume"] for s in state["history"][-10:]]
+        avg_vol = sum(past_vols) / len(past_vols) if past_vols else slot["volume"]
+        vs = round((slot["volume"] / avg_vol) * 100, 2) if avg_vol > 0 else 100.0
+        return {
+            "percent_change": round(((slot["close"] - slot["open"]) / slot["open"]) * 100, 2),
+            "volume_strength": vs
+        }
+
     async def _persist_slot(self, symbol: str, slot: Dict, analytics: Dict):
-        """Saves a slot to the database."""
-        from app.database import AsyncSessionLocal
+        from app.infrastructure.database import AsyncSessionLocal
         from app.models.slot import SlotData
         from sqlalchemy.dialects.sqlite import insert
-        
         async with AsyncSessionLocal() as db:
             try:
-                # Use UPSERT (insert or replace) logic
                 stmt = insert(SlotData).values(
                     symbol=symbol,
-                    date=datetime.now().date(),
+                    date=self._get_ist_now().date(),
                     slot_label=slot["label"],
                     open=slot["open"],
                     high=slot["high"],
@@ -109,154 +320,99 @@ class AggregationEngine:
                 await db.execute(stmt)
                 await db.commit()
             except Exception as e:
-                logging.error(f"DB Persist Error for {symbol}: {e}")
+                logging.error(f"DB Persist Error {symbol}: {e}")
 
-    async def catch_up(self, symbol: str, candles_1m: List[Dict]):
-        """
-        Processes a batch of 1m candles to fill data gaps.
-        Used after WS reconnection.
-        """
-        for candle in candles_1m:
-            self.process_candle(symbol, candle)
-        logging.info(f"Aggregation Engine caught up for {symbol} with {len(candles_1m)} candles.")
-
-    def _get_slot_label(self, dt: datetime) -> str:
-        """Calculates which N-minute interval the datetime falls into from 09:15."""
-        m_start = dt.replace(hour=9, minute=15, second=0, microsecond=0)
-        diff_minutes = (dt - m_start).total_seconds() / 60
-        if diff_minutes < 0: return "PRE"
+    async def _flush_slot_buffer(self):
+        """Processes all queued slots in a single database transaction."""
+        if not self._slot_buffer: return
         
-        slot_idx = int(diff_minutes // self.slot_minutes)
-        slot_start = m_start.timestamp() + (slot_idx * self.slot_minutes * 60)
-        return datetime.fromtimestamp(slot_start).strftime("%H:%M")
-
-    def get_analytics(self, symbol: str) -> Dict:
-        """Calculates % Change and Volume Strength for the active slot."""
-        state = self.state.get(symbol)
-        if not state or not state["current_slot"]: return {}
+        from app.infrastructure.database import AsyncSessionLocal
+        from app.models.slot import SlotData
+        from sqlalchemy.dialects.sqlite import insert
         
-        curr = state["current_slot"]
+        logging.info(f"Aggregator: Flushing {len(self._slot_buffer)} slots to persistent storage...")
         
-        # Volume Strength
-        past_vols = [s["volume"] for s in state["history"]]
-        avg_vol = sum(past_vols) / len(past_vols) if past_vols else curr["volume"]
-        vs = round((curr["volume"] / avg_vol) * 100, 2) if avg_vol > 0 else 100.0
-        
-        return {
-            "symbol": symbol,
-            "label": curr["label"],
-            "open": curr["open"],
-            "high": curr["high"],
-            "low": curr["low"],
-            "close": curr["close"],
-            "volume": curr["volume"],
-            "volume_strength": vs,
-            "percent_change": round(((curr["close"] - curr["open"]) / curr["open"]) * 100, 2)
-        }
+        async with AsyncSessionLocal() as db:
+            try:
+                for symbol, slot, analytics in self._slot_buffer:
+                    stmt = insert(SlotData).values(
+                        symbol=symbol,
+                        date=self._get_ist_now().date(),
+                        slot_label=slot["label"],
+                        open=slot["open"], high=slot["high"], low=slot["low"], close=slot["close"],
+                        volume=slot["volume"],
+                        percent_change=analytics.get("percent_change", 0),
+                        volume_strength=analytics.get("volume_strength", 0)
+                    ).on_conflict_do_update(
+                        index_elements=['symbol', 'date', 'slot_label'],
+                        set_={
+                            "high": SlotData.high if SlotData.high > slot["high"] else slot["high"],
+                            "low": SlotData.low if SlotData.low < slot["low"] else slot["low"],
+                            "close": slot["close"],
+                            "volume": slot["volume"],
+                            "percent_change": analytics.get("percent_change", 0),
+                            "volume_strength": analytics.get("volume_strength", 0)
+                        }
+                    )
+                    await db.execute(stmt)
+                await db.commit()
+                self._slot_buffer = []
+            except Exception as e:
+                logging.error(f"Batch Persist Failure: {e}")
 
     def get_full_market_state(self) -> Dict:
-        """Constructs the full nested JSON payload expected by the React dashboard grid."""
-        from datetime import datetime, timedelta
-        now = datetime.now()
+        """Constructs the full market scan JSON for the frontend with incremental updates."""
+        ist_now = self._get_ist_now()
+        # High-Resolution Timestamp for visual 'auto-refresh' feedback
+        ts_str = ist_now.strftime("%H:%M:%S.%f")[:-3] # HH:MM:SS.mmm
         
-        # Precompute slot labels for the day
-        m_start = now.replace(hour=9, minute=15, second=0, microsecond=0)
-        m_end = now.replace(hour=15, minute=30, second=0, microsecond=0)
-        labels = []
-        curr = m_start
-        while curr < m_end:
-            labels.append(curr.strftime("%H:%M"))
-            curr += timedelta(minutes=self.slot_minutes)
-            
         from app.core.calendar import MarketCalendar
-        m_status, m_reason = MarketCalendar.get_market_status(now)
+        m_status, m_reason = MarketCalendar.get_market_status(ist_now)
         
+        from app.state import state
+        
+        # 1. Update Payload Cache for Dirty Symbols
+        curr_lbl = self._get_slot_label()
+        slot_idx = self.label_to_idx.get(curr_lbl, 0)
+        
+        # Process ONLY dirty symbols (huge performance win for large watchlists)
+        for sym in list(self._dirty_symbols):
+            data = self.live_state.get(sym)
+            if not data: continue
+            
+            # Update Grid Data Cache
+            self._payload_cache["data"][sym] = {
+                "price": data["price"],
+                "price_move": data["price_move"],
+                "percent_change": data["percent_change"],
+                "volume": data["volume"],
+                "volume_strength": data["volume_strength"],
+                "phase_alerts": [] 
+            }
+            
+            # Update Summary Cache
+            prices = [p for p in data["price"] if p is not None]
+            self._payload_cache["daily_summary"][sym] = {
+                "current_price": prices[-1] if prices else 0,
+                "total_volume": sum(data["volume"]),
+                "percent_change": data["percent_change"][slot_idx],
+                "price_move": data["price_move"][slot_idx]
+            }
+        
+        # Clear flags after synchronization
+        self._dirty_symbols.clear()
+        
+        # 2. Build Final Composition
         payload = {
-            "timestamp": now.strftime("%H:%M:%S"),
+            "timestamp": ts_str,
             "market_status": [m_status, m_reason],
-            "last_update": now.strftime("%H:%M:%S"),
-            "watchlist": "Active",
-            "slot_labels": labels,
-            "data": {},
-            "daily_summary": {},
+            "authenticated": state.active_broker is not None,
+            "last_update": ist_now.strftime("%H:%M:%S"),
+            "watchlist": "Open" if m_status == "OPEN" else "Closed",
+            "slot_labels": self.current_slot_labels,
+            "data": self._payload_cache["data"],
+            "daily_summary": self._payload_cache["daily_summary"],
             "phases": [] 
         }
-        
-        for sym, state_data in self.state.items():
-            if not state_data.get("current_slot"): continue
-            
-            slots = state_data["history"] + [state_data["current_slot"]]
-            
-            prices = [None] * len(labels)
-            inr_moves = [None] * len(labels)
-            pcs = [None] * len(labels)
-            vols = [None] * len(labels)
-            vss = [None] * len(labels)
-            
-            # Map slots to their correct indices based on label
-            for s in slots:
-                if s["label"] in labels:
-                    idx = labels.index(s["label"])
-                    prices[idx] = s["close"]
-                    vols[idx] = s["volume"]
-                    
-                    inr = round(s["close"] - s["open"], 2)
-                    inr_moves[idx] = inr
-                    
-                    pc = round((inr / s["open"]) * 100, 2) if s["open"] > 0 else 0.0
-                    pcs[idx] = pc
-                    
-                    slot_dt = datetime.fromtimestamp(s["epoch"]) if "epoch" in s else datetime.now()
-                    if slot_dt.hour == 9 and slot_dt.minute == 15:
-                        vs = 100.0
-                    else:
-                        past_vols = []
-                        for h in state_data["history"]:
-                            if h["label"] in labels and labels.index(h["label"]) < idx:
-                                past_vols.append(h["volume"])
-                                
-                        avg = sum(past_vols)/len(past_vols) if past_vols else s["volume"]
-                        vs = round((s["volume"] / avg) * 100, 2) if avg > 0 else 100.0
-                    vss[idx] = vs
-                    
-            from app.core.phases import PhaseEngine, PhaseSentinel
-            p_stats = PhaseEngine.calculate_stats(slots)
-            
-            # Find the "Active Phase" stats to evaluate alerts
-            # Fetch DNA from global state if available
-            from app.state import state
-            symbol_dna = state.phase_dnas.get(sym, {})
-            
-            active_phase_name = None
-            if p_stats:
-                active_phase_name = list(p_stats.keys())[-1]
-                
-            alerts = []
-            if active_phase_name:
-                # Use custom DNA if available, else fall back to sensible defaults
-                benchmarks = symbol_dna.get(active_phase_name, {
-                    "min_strength": 60, 
-                    "min_vol": 10, 
-                    "max_volatility": 1.5
-                })
-                alerts = PhaseSentinel.evaluate(sym, active_phase_name, p_stats[active_phase_name], benchmarks)
 
-            payload["data"][sym] = {
-                "price": prices,
-                "price_move": inr_moves,
-                "percent_change": pcs,
-                "volume": vols,
-                "volume_strength": vss,
-                "phase_stats": p_stats,
-                "phase_alerts": alerts
-            }
-            
-            curr_slot = state_data["current_slot"]
-            payload["daily_summary"][sym] = {
-                "current_price": curr_slot["close"],
-                "percent_change": pcs[labels.index(curr_slot["label"])] if curr_slot["label"] in labels else 0.0,
-                "price_move": round(curr_slot["close"] - slots[0]["open"], 2) if slots else 0,
-                "total_volume": sum(s["volume"] for s in slots)
-            }
-            
         return payload

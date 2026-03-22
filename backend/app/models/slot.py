@@ -1,5 +1,5 @@
 from sqlalchemy import Column, Integer, String, Float, Date, UniqueConstraint
-from app.database import Base
+from app.infrastructure.database.base import Base
 
 class SlotData(Base):
     """

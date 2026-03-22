@@ -1,7 +1,7 @@
 import React, { useState } from 'react';
 import { Zap, Shield, ArrowRight, Loader2, AlertCircle } from 'lucide-react';
 import { clsx } from 'clsx';
-import { api } from '../services/api';
+import { api } from '../../api';
 
 const BROKERS = [
     {

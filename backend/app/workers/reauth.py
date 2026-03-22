@@ -4,9 +4,9 @@ import time
 from datetime import datetime, timedelta
 from typing import Callable, Any
 from sqlalchemy import select, update
-from app.database import AsyncSessionLocal
+from app.infrastructure.database import AsyncSessionLocal
 from app.models.session import BrokerSession
-from app.core.audit import audit_log
+from app.infrastructure.audit import audit_log
 
 class CircuitBreaker:
 	"""
@@ -30,13 +30,20 @@ class CircuitBreaker:
 				raise Exception(f"Circuit Breaker [{self.name}] is OPEN. Failing fast.")
 
 		try:
-			result = await func(*args, **kwargs)
+			# Execute the function
+			result = func(*args, **kwargs)
+			
+			# Check if the result is awaitable (async)
+			if asyncio.iscoroutine(result) or asyncio.iscoroutinefunction(func) or hasattr(result, "__await__"):
+				result = await result
+				
 			if self.state == "HALF-OPEN":
 				logging.info(f"Circuit Breaker [{self.name}] moving to CLOSED")
 				self.state = "CLOSED"
 				self.failures = 0
 			return result
 		except Exception as e:
+			logging.error(f"Circuit Breaker [{self.name}] call failed: {e}")
 			self.failures += 1
 			self.last_failure_time = time.time()
 			if self.failures >= self.failure_threshold:
@@ -61,7 +68,7 @@ async def proactive_token_rotator():
 			threshold = datetime.utcnow() + timedelta(minutes=20)
 			result = await db.execute(
 				select(BrokerSession)
-				.filter(BrokerSession.is_active == 1)
+				.filter(BrokerSession.session_active == 1)
 				.filter(BrokerSession.expires_at <= threshold)
 			)
 			expiring_sessions = result.scalars().all()

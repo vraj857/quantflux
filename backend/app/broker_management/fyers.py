@@ -1,4 +1,4 @@
-import logging
+from app.infrastructure.logging import ql_logger as logging
 import asyncio
 from typing import List, Dict, Any, Optional
 from app.broker_management.base import IBroker
@@ -22,7 +22,10 @@ class FyersAdapter(IBroker):
         self.api: Optional[Any] = None
         self.ws: Optional[Any] = None
         self.on_tick_callback: Optional[callable] = None
+        self.ws_connected: bool = False
+        self.symbols_to_subscribe: List[str] = []
         self._last_tick_times: Dict[str, datetime] = {}
+        self.loop: Optional[asyncio.AbstractEventLoop] = None # Store main loop handle
         
         # Tiered Log Path
         from config import LOGS_DIR
@@ -144,7 +147,14 @@ class FyersAdapter(IBroker):
         ]
 
     async def start_ticker(self, symbols: List[str], on_tick: callable):
+        # 1. Properly stop any existing socket
+        if self.ws:
+            logging.info("Stopping existing Fyers WS before restarting...")
+            await self.stop_ticker()
+            await asyncio.sleep(0.5) # Give it time to close
+
         self.on_tick_callback = on_tick
+        self.loop = asyncio.get_running_loop() # Capture current loop for background callbacks
         access_token_full = f"{self.client_id}:{self.access_token}"
         
         self.symbols_to_subscribe = []
@@ -172,9 +182,15 @@ class FyersAdapter(IBroker):
         t.start()
 
     def _on_connect(self):
-        logging.info("Fyers Adapter connected to WS")
+        self.ws_connected = True
+        logging.info(f"Fyers Adapter connected to WS. Subscribing to {len(self.symbols_to_subscribe)} symbols...")
         if self.symbols_to_subscribe:
-            self.ws.subscribe(symbol=self.symbols_to_subscribe, data_type="SymbolUpdate")
+            # Fyers V3 limits: 50 symbols per subscribe request
+            CHUNK_SIZE = 50
+            for i in range(0, len(self.symbols_to_subscribe), CHUNK_SIZE):
+                batch = self.symbols_to_subscribe[i:i+CHUNK_SIZE]
+                logging.info(f"Fyers WS Batch Subscribe: {len(batch)} symbols...")
+                self.ws.subscribe(symbols=batch, data_type="SymbolUpdate")
 
     def _on_message(self, message):
         if self.on_tick_callback:
@@ -189,21 +205,92 @@ class FyersAdapter(IBroker):
                     "volume": message.get('vol_traded_today', 0),
                     "timestamp": message.get('timestamp')
                 }
-                # Use threadsafe for callback if needed
-                # Handle async callback from sync SDK thread
-                loop = asyncio.get_event_loop()
-                asyncio.run_coroutine_threadsafe(self.on_tick_callback(tick), loop)
+                # Handle async callback from sync SDK thread safely
+                if self.loop:
+                    asyncio.run_coroutine_threadsafe(self.on_tick_callback(tick), self.loop)
+                else:
+                    logging.error("Fyers WS: Cannot process tick - No event loop handle!")
+
+    def _on_error(self, message):
+        logging.error(f"Fyers WS Error: {message}")
+        # If the error involves the loop being closed, we log it but don't crash
+
+    def _on_close(self):
+        self.ws_connected = False
+        logging.info("Fyers WS Connection Closed")
 
     async def stop_ticker(self):
         if self.ws:
-            await asyncio.to_thread(self.ws.close)
+            try:
+                await asyncio.to_thread(self.ws.close)
+            except Exception as e:
+                logging.error(f"Error closing Fyers WS: {e}")
+            finally:
+                self.ws = None
+        self.ws_connected = False
+        self.symbols_to_subscribe = []
 
     def is_connected(self) -> bool:
         return self.access_token is not None
 
+    def get_subscribed_symbols(self) -> List[str]:
+        """Returns the list of symbols currently subscribed to the WS feed."""
+        return list(self.symbols_to_subscribe)
+
+    async def get_quotes(self, symbols: List[str]) -> List[Dict[str, Any]]:
+        """
+        Fetches today's OHLCV + LTP via the Fyers REST quotes endpoint.
+        Works 24/7 — returns last session's data even after market close.
+        """
+        await self.rate_limiter.consume()
+        # Convert internal symbols to Fyers format (NSE:SYM-EQ)
+        fyers_syms = []
+        reverse_map = {}
+        for sym in symbols:
+            f_sym = sym
+            if sym.startswith("NSE:") and "-" not in sym:
+                f_sym = f"{sym}-EQ"
+            fyers_syms.append(f_sym)
+            reverse_map[f_sym] = sym
+
+        if not fyers_syms:
+            return []
+
+        try:
+            data = {"symbols": ",".join(fyers_syms)}
+            res = await asyncio.to_thread(self.api.quotes, data=data)
+            if res.get("s") != "ok":
+                logging.error(f"Fyers Quotes Error: {res}")
+                return []
+
+            results = []
+            for item in res.get("d", []):
+                q = item.get("v", {})
+                f_sym = item.get("n", "")
+                app_sym = reverse_map.get(f_sym, f_sym)
+                results.append({
+                    "symbol": app_sym,
+                    "ltp": q.get("lp", 0),
+                    "open": q.get("open_price", 0),
+                    "high": q.get("high_price", 0),
+                    "low": q.get("low_price", 0),
+                    "close": q.get("prev_close_price", 0),
+                    "volume": q.get("volume", 0),
+                    "change": q.get("ch", 0),          # Absolute change
+                    "change_pct": round(q.get("chp", 0), 2)  # % change from prev close
+                })
+            return results
+        except Exception as e:
+            logging.error(f"Fyers get_quotes exception: {e}")
+            return []
+
     async def validate_token(self) -> bool:
         try:
             profile = await self.get_profile()
-            return bool(profile and profile.get("client_id"))
-        except Exception:
+            is_valid = bool(profile and profile.get("client_id"))
+            if not is_valid:
+                logging.warning(f"Fyers token validation failed: Profile returned {profile}")
+            return is_valid
+        except Exception as e:
+            logging.error(f"Fyers token validation exception: {e}")
             return False

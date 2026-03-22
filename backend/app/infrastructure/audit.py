@@ -52,8 +52,7 @@ class AuditLogger:
             "action": action,
             "broker": broker,
             "ip_address": ip_address,
-            "status": status,
-            "message": message
+            "status": status
         }
         if extra:
             log_data.update(extra)

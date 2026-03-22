@@ -1,4 +1,9 @@
-
+/**
+ * QuantFlux API Service Layer
+ * Description: Centralized axios-like wrapper for all backend communication.
+ *              Supports Auth, Market Data, and Watchlist management.
+ * Version: 2.1.0
+ */
 const BASE_URL = 'http://127.0.0.1:8000';
 
 const apiRequest = async (endpoint, options = {}) => {
@@ -42,6 +47,10 @@ export const api = {
     getWatchlist: (name) => apiRequest(`/api/watchlist?name=${name}`),
     getWatchlistNames: () => apiRequest('/api/watchlist/names'),
     addToWatchlist: (name, symbol) => apiRequest('/api/watchlist/add', { method: 'POST', body: { name, symbol } }),
+    bulkUpload: (name, text) => apiRequest('/api/watchlist/bulk', { method: 'POST', body: { name, text } }),
     removeFromWatchlist: (name, symbol) => apiRequest('/api/watchlist/remove', { method: 'POST', body: { name, symbol } }),
+    deleteWatchlist: (name) => apiRequest(`/api/watchlist/delete-list?name=${encodeURIComponent(name)}`, { method: 'POST' }),
     syncWatchlist: (symbols) => apiRequest('/api/market/update-watchlist', { method: 'POST', body: { symbols } }),
+    getSnapshot: (name = 'Default') => apiRequest(`/api/market/snapshot?watchlist=${encodeURIComponent(name)}`),
+    getSubscriptions: () => apiRequest('/api/market/subscriptions'),
 };

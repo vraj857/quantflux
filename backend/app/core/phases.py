@@ -7,16 +7,12 @@ class PhaseEngine:
     Used by both Historical Backtesting and Live Tick Aggregation.
     """
     
-    # Phase boundaries in minutes from 9:15 for 25-min slots:
-    # Morning (9:15–10:30): slots 0,1,2
-    # Midday (10:30–12:35): slots 3,4,5,6,7
-    # Trend (12:35–14:15): slots 8,9,10,11
-    # Closing (14:15–15:30): slots 12,13,14
+    # Phase boundaries in absolute hour/minute coordinates
     PHASE_BOUNDS = [
-        {"name": "Morning Phase",    "label": "Morning (9:15–10:30)",      "slots": list(range(0, 3))},
-        {"name": "Midday Chop",      "label": "Midday Chop (10:30–12:35)", "slots": list(range(3, 8))},
-        {"name": "Trend Formation",  "label": "Trend Formation (12:35–14:15)", "slots": list(range(8, 12))},
-        {"name": "Closing Session",  "label": "Closing Session (14:15–15:30)","slots": list(range(12, 15))},
+        {"name": "Morning Phase",    "label": "Morning (9:15–10:30)",      "start": (9, 15), "end": (10, 30)},
+        {"name": "Midday Chop",      "label": "Midday Chop (10:30–12:35)", "start": (10, 30), "end": (12, 35)},
+        {"name": "Trend Formation",  "label": "Trend Formation (12:35–14:15)", "start": (12, 35), "end": (14, 15)},
+        {"name": "Closing Session",  "label": "Closing Session (14:15–15:30)","start": (14, 15), "end": (15, 30)},
     ]
 
     @staticmethod
@@ -51,8 +47,21 @@ class PhaseEngine:
             day_efficiencies = []
             
             for day_key, day_slots in days_map.items():
-                # Filter slots belonging to this phase in the current day
-                p_day_slots = [day_slots[i] for i in phase["slots"] if i < len(day_slots)]
+                p_day_slots = []
+                start_mins = phase["start"][0] * 60 + phase["start"][1]
+                end_mins = phase["end"][0] * 60 + phase["end"][1]
+                
+                for s in day_slots:
+                    dt = datetime.fromtimestamp(s["epoch"])
+                    slot_mins = dt.hour * 60 + dt.minute
+                    
+                    if phase["name"] == "Closing Session":
+                        if start_mins <= slot_mins <= end_mins:
+                            p_day_slots.append(s)
+                    else:
+                        if start_mins <= slot_mins < end_mins:
+                            p_day_slots.append(s)
+                
                 if not p_day_slots: continue
                 
                 all_phase_slots.extend(p_day_slots)
@@ -94,7 +103,7 @@ class PhaseEngine:
                 "persistence":  round((sum(1 for x in p_pcs if x > 0) / len(p_pcs)) * 100, 1) if p_pcs else 0.0,
                 "slots":        len(all_phase_slots),
                 "mean_price":   safe_avg(p_prices),
-                "phase_yield":  safe_avg(p_pcs) * len(phase["slots"]) / 2 # Approx
+                "phase_yield":  safe_avg(p_pcs) * (len(all_phase_slots) / max(1, len(days_map))) / 2 # Approx yield
             }
             
         return phase_stats

@@ -1,9 +1,9 @@
 from fastapi import APIRouter, Depends, HTTPException
 from sqlalchemy.ext.asyncio import AsyncSession
-from app.database import get_async_db
+from app.infrastructure.database import get_async_db
 from app.models.watchlist import WatchlistMember
 from sqlalchemy import select, delete, distinct
-from typing import List, Dict, Any
+from typing import List, Dict, Any, Set
 import logging
 
 from pydantic import BaseModel
@@ -24,17 +24,31 @@ class WatchlistRemoveRequest(BaseModel):
 
 @router.get("/names")
 async def list_watchlist_names(db: AsyncSession = Depends(get_async_db)):
-    """Returns all distinct watchlist collection names."""
+    """Returns all distinct watchlist collection names from DB."""
+    # 1. Start with mandatory "Default"
+    names: Set[str] = {"Default"}
+        
+    # 2. Extract from DB
     result = await db.execute(select(distinct(WatchlistMember.list_name)))
-    names = [row[0] for row in result.all()]
-    return names if names else ["Default"]
+    db_names = [row[0] for row in result.all()]
+    names.update(db_names)
+    
+    # 3. Sort (Default first, then others)
+    sorted_names = sorted(list(names))
+    if "Default" in sorted_names:
+        sorted_names.remove("Default")
+        sorted_names = ["Default"] + sorted_names
+        
+    return sorted_names
 
 @router.get("/")
 async def list_watchlist(name: str = "Default", db: AsyncSession = Depends(get_async_db)):
-    """Lists all symbols in a given watchlist."""
+    """Lists all symbols in a given watchlist from DB."""
     result = await db.execute(select(WatchlistMember).filter(WatchlistMember.list_name == name))
     items = result.scalars().all()
-    return [i.symbol for i in items]
+    # Unique sorted symbols
+    symbols = sorted(list(set([i.symbol for i in items])))
+    return symbols
 
 @router.post("/add")
 async def add_to_watchlist(data: WatchlistAddRequest, db: AsyncSession = Depends(get_async_db)):
@@ -85,4 +99,4 @@ async def delete_watchlist(name: str, db: AsyncSession = Depends(get_async_db)):
 async def get_watchlist_symbols(name: str, db: AsyncSession) -> List[str]:
     """Internal helper to get symbols for a watchlist."""
     result = await db.execute(select(WatchlistMember).filter(WatchlistMember.list_name == name))
-    return [i.symbol for i in result.scalars().all()]
+    return sorted(list(set([i.symbol for i in result.scalars().all()])))

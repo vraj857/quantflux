@@ -1,6 +1,6 @@
 import os
 import base64
-from typing import Tuple
+from typing import Tuple, Dict
 from cryptography.hazmat.primitives.ciphers.aead import AESGCM
 from cryptography.hazmat.primitives.kdf.pbkdf2 import PBKDF2HMAC
 from cryptography.hazmat.primitives import hashes
@@ -12,9 +12,9 @@ class MockKMS:
     """
     def __init__(self):
         # Master Key would be stored in an Environment Variable or Secrets Manager
-        self._master_key = os.getenv("QUANTFLUX_MASTER_KEY", "uH9oY_mock_master_key_32_bytes_len_!!")
-        if len(self._master_key) < 32:
-            self._master_key = self._master_key.ljust(32, "0")[:32]
+        raw_key = os.getenv("QUANTFLUX_MASTER_KEY", "quantflux_enterprise_master_secret")
+        # Normalize to exactly 32 bytes (256 bits) for AES-256-GCM
+        self._master_key = raw_key.encode().ljust(32, b"0")[:32]
 
     def get_dek(self) -> bytes:
         """Generates a new Data Encryption Key (DEK)."""
@@ -22,7 +22,7 @@ class MockKMS:
 
     def encrypt_dek(self, dek: bytes) -> str:
         """Wraps the DEK using the Master Key."""
-        aesgcm = AESGCM(self._master_key.encode())
+        aesgcm = AESGCM(self._master_key)
         nonce = os.urandom(12)
         encrypted = aesgcm.encrypt(nonce, dek, None)
         return base64.b64encode(nonce + encrypted).decode('utf-8')
@@ -31,7 +31,7 @@ class MockKMS:
         """Unwraps the DEK using the Master Key."""
         data = base64.b64decode(wrapped_dek)
         nonce, ciphertext = data[:12], data[12:]
-        aesgcm = AESGCM(self._master_key.encode())
+        aesgcm = AESGCM(self._master_key)
         return aesgcm.decrypt(nonce, ciphertext, None)
 
 class EnvelopeEncryption:

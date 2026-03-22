@@ -3,7 +3,7 @@ import logging
 import asyncio
 from typing import Any, Dict, Optional, List
 import redis.asyncio as redis
-from app.security.encryption import security_engine
+from app.infrastructure.security.encryption import security_engine
 
 # Configuration
 REDIS_URL = "redis://localhost:6379/0"
@@ -37,22 +37,36 @@ class MockPubSub:
 class RedisStateStore:
     """Stateless session coordination with In-Memory fallback."""
     def __init__(self, url: str = REDIS_URL):
+        self.url = url
+        self.pool = redis.ConnectionPool.from_url(url, decode_responses=True)
+        self.client = redis.Redis(connection_pool=self.pool)
+        self.use_mock = False
+        self._connection_checked = False
+
+    async def _ensure_connection(self):
+        """Deferred connection check to trigger fallback only on actual failure."""
+        if self.use_mock or self._connection_checked:
+            return
         try:
-            self.pool = redis.ConnectionPool.from_url(url, decode_responses=True)
-            self.client = redis.Redis(connection_pool=self.pool)
-            self.use_mock = False
+            # Simple ping to verify network availability
+            await asyncio.wait_for(self.client.ping(), timeout=2.0)
+            self._connection_checked = True
             logging.info("RedisStateStore: Connected to Redis server.")
         except Exception:
-            logging.warning("RedisStateStore: Redis server not found. Falling back to In-Memory Mock.")
-            self.client = MockRedisClient()
             self.use_mock = True
+            self.client = MockRedisClient()
+            logging.critical("CRITICAL: REDIS OFFLINE - Shifting to Stateless In-Memory Mock (Local-Only Mode)")
+            from app.infrastructure.audit import audit_log
+            audit_log.log_event("SYSTEM_MODE_SHIFT", status="WARNING", message="Redis connection failed. Switched to In-Memory Fallback.")
 
     async def save_session(self, user_id: str, broker: str, tokens: Dict[str, str], metadata: Dict[str, Any] = None):
+        await self._ensure_connection()
         key = f"quantflux:session:{user_id}:{broker}"
         payload = {"tokens": tokens, "metadata": metadata or {}, "status": "ACTIVE"}
         await self.client.set(key, json.dumps(payload))
 
     async def get_session(self, user_id: str, broker: str) -> Optional[Dict[str, Any]]:
+        await self._ensure_connection()
         key = f"quantflux:session:{user_id}:{broker}"
         raw = await self.client.get(key)
         if not raw: return None
@@ -71,18 +85,28 @@ class RedisStateStore:
 class MarketDataPubSub:
     """Scalable Market Data distribution with In-Memory fallback."""
     def __init__(self, url: str = REDIS_URL):
+        self.url = url
+        self.client = redis.Redis.from_url(url)
+        self.use_mock = False
+        self._connection_checked = False
+
+    async def _ensure_connection(self):
+        if self.use_mock or self._connection_checked:
+            return
         try:
-            self.client = redis.Redis.from_url(url)
-            self.use_mock = False
+            await asyncio.wait_for(self.client.ping(), timeout=2.0)
+            self._connection_checked = True
         except Exception:
-            self.client = MockRedisClient()
             self.use_mock = True
+            self.client = MockRedisClient()
 
     async def publish_tick(self, symbol: str, tick_data: Dict[str, Any]):
+        await self._ensure_connection()
         channel = f"market:ticks:{symbol}"
         await self.client.publish(channel, json.dumps(tick_data))
 
     async def subscribe_to_symbols(self, symbols: List[str], callback):
+        await self._ensure_connection()
         if self.use_mock:
             logging.info(f"Local-Only Mode: Subscribing to {symbols} (In-Memory)")
             # Register the callback in the mock client for each symbol channel

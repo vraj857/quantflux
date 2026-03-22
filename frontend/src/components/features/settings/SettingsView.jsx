@@ -10,7 +10,7 @@ import {
     Upload
 } from 'lucide-react';
 import { clsx } from 'clsx';
-import { api } from '../services/api';
+import { api } from '../../../api';
 
 const SettingsView = ({ theme, onAuthSuccess }) => {
     const storedSession = JSON.parse(sessionStorage.getItem('BROKER_SESSION') || '{}');
@@ -38,15 +38,21 @@ const SettingsView = ({ theme, onAuthSuccess }) => {
     const fetchCollections = useCallback(async () => {
         try {
             const names = await api.getWatchlistNames();
-            setCollections(names);
-            if (!names.includes(activeCollection)) {
-                setActiveCollection(names[0] || 'Default');
-            }
-        } catch (e) { setCollections(['Default']); }
-    }, [activeCollection]);
+            setCollections(prev => {
+                // Merge server names with any locally "pending" collections
+                // We assume anything in `prev` that isn't in `names` might be a pending new collection
+                // (except if it was just deleted, but delete logic handles that)
+                const merged = [...new Set([...names, ...prev])];
+                return merged;
+            });
+        } catch (e) { 
+            setCollections(prev => [...new Set(['Default', ...prev])]); 
+        }
+    }, []); // Removed activeCollection to prevent re-fetch loops
 
     // Fetch symbols for the currently active collection
     const fetchSymbols = useCallback(async (name) => {
+        if (!name) return;
         try {
             const data = await api.getWatchlist(name);
             setSymbols(data);
@@ -54,7 +60,11 @@ const SettingsView = ({ theme, onAuthSuccess }) => {
     }, []);
 
     useEffect(() => { fetchCollections(); }, [fetchCollections]);
-    useEffect(() => { fetchSymbols(activeCollection); }, [activeCollection, fetchSymbols]);
+    useEffect(() => { 
+        if (activeCollection && collections.includes(activeCollection)) {
+            fetchSymbols(activeCollection); 
+        }
+    }, [activeCollection, collections, fetchSymbols]);
 
     const startLoginFlow = async () => {
         try {
@@ -88,8 +98,7 @@ const SettingsView = ({ theme, onAuthSuccess }) => {
     const deleteCollection = async (name) => {
         if (name === 'Default') return;
         try {
-            // Updated to use the endpoint that supports query params
-            await apiRequest(`/api/watchlist/delete-list?name=${encodeURIComponent(name)}`, { method: 'POST' });
+            await api.deleteWatchlist(name);
             const remaining = collections.filter(c => c !== name);
             setCollections(remaining);
             setActiveCollection(remaining[0] || 'Default');
@@ -103,10 +112,8 @@ const SettingsView = ({ theme, onAuthSuccess }) => {
             const data = await api.addToWatchlist(activeCollection, newSymbol);
             setSymbols(prev => [...new Set([...prev, ...data.added])]);
             setNewSymbol('');
-            // Make sure collection appears in the names list now
-            if (!collections.includes(activeCollection)) {
-                await fetchCollections();
-            }
+            // Make sure collection appears in the names list now (it's persisted in DB)
+            await fetchCollections();
             refreshLiveFeed(activeCollection);
         } catch (e) { showMessage('Add failed.', 'error'); }
     };
@@ -123,7 +130,7 @@ const SettingsView = ({ theme, onAuthSuccess }) => {
         if (!bulkText) return;
         setLoading(true);
         try {
-            await axios.post(`http://127.0.0.1:8000/api/watchlist/bulk?text=${encodeURIComponent(bulkText)}&name=${activeCollection}`);
+            await api.bulkUpload(activeCollection, bulkText);
             await fetchSymbols(activeCollection);
             await fetchCollections();
             setBulkText('');

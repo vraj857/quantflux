@@ -1,5 +1,5 @@
 from sqlalchemy import Column, String, Float, JSON, DateTime, Integer
-from app.database import Base
+from app.infrastructure.database.base import Base
 from datetime import datetime
 
 class PhaseDNA(Base):
