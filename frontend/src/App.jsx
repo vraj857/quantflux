@@ -14,7 +14,7 @@ import PhaseSimulatorView from './components/features/simulator/PhaseSimulatorVi
 import OrderConsole from './components/features/analytics/OrderConsole';
 import BrokerLoginGate from './components/layout/BrokerLoginGate';
 import { useMarketData } from './hooks/useMarketData';
-import { Monitor, History, LayoutDashboard, Zap, ShieldCheck, Settings as SettingsIcon, Play, Target } from 'lucide-react';
+import { Monitor, History, LayoutDashboard, Zap, ShieldCheck, Settings as SettingsIcon, Play, Target, Maximize2, Minimize2 } from 'lucide-react';
 
 import { clsx } from 'clsx';
 import { api } from './api';
@@ -58,6 +58,7 @@ const App = () => {
     });
     const [brokerProfile, setBrokerProfile] = useState(null);
     const [snapshot, setSnapshot] = useState(null);
+    const [isLiveFeedFullscreen, setIsLiveFeedFullscreen] = useState(false);
     const [subscriptions, setSubscriptions] = useState(null);
     const { marketData, status } = useMarketData();
 
@@ -347,7 +348,7 @@ const App = () => {
                     <div className={clsx("flex-1 flex flex-col h-full", theme === 'dark' ? "bg-[#13131a]" : "bg-white")}>
                         {/* Header Section for Branding/Navigation */}
                         <div className="px-8 pt-6 pb-2 flex justify-between items-end border-b border-white/[0.02]">
-                            <div className="flex-1 flex items-start justify-between">
+                            <div className={clsx("flex-1 flex items-start justify-between transition-all duration-300", isLiveFeedFullscreen && activeView === 'live' && "opacity-0 h-0 overflow-hidden mb-0")}>
                                 <div>
                                     <h1 className={clsx(
                                         "text-4xl font-black tracking-tighter uppercase italic leading-none",
@@ -403,11 +404,24 @@ const App = () => {
                                             ))}
                                         </div>
                                     </div>
+                                    
+                                    {/* Fullscreen Toggle */}
+                                    <div className="h-8 w-px bg-white/10"></div>
+                                    <button
+                                        onClick={() => setIsLiveFeedFullscreen(!isLiveFeedFullscreen)}
+                                        className={clsx(
+                                            "size-8 flex items-center justify-center rounded-xl border transition-all hover:scale-105 active:scale-95",
+                                            theme === 'dark' ? "bg-white/5 border-white/10 text-gray-400 hover:text-white" : "bg-gray-100 border-gray-200 text-gray-600 hover:text-black"
+                                        )}
+                                        title={isLiveFeedFullscreen ? "Exit Fullscreen" : "Fullscreen Mode"}
+                                    >
+                                        {isLiveFeedFullscreen ? <Minimize2 size={14} /> : <Maximize2 size={14} />}
+                                    </button>
                                 </div>
                             </div>
 
                             {/* Activity Ticker Bar */}
-                            <div className="flex-1 flex items-center justify-end space-x-4 max-w-2xl overflow-hidden">
+                            <div className={clsx("flex-1 flex items-center justify-end space-x-4 max-w-2xl overflow-hidden transition-all duration-300", isLiveFeedFullscreen && activeView === 'live' && "opacity-0 h-0 overflow-hidden")}>
                                 {latestLogs.length > 0 ? (
                                     <div className="flex items-center space-x-2 animate-in fade-in slide-in-from-right-4 duration-500">
                                         <div className="size-1.5 bg-indigo-500 rounded-full animate-pulse"></div>

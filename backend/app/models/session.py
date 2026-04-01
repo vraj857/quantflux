@@ -1,5 +1,6 @@
 from sqlalchemy import Column, Integer, String, DateTime, JSON
 from app.infrastructure.database.base import Base
+from app.infrastructure.database.types import EncryptedString
 from datetime import datetime
 
 class BrokerSession(Base):
@@ -12,11 +13,9 @@ class BrokerSession(Base):
     id = Column(Integer, primary_key=True, index=True)
     broker = Column(String, index=True)  # "FYERS" or "ZERODHA"
     
-    # Encrypted fields for Enterprise Security
-    encrypted_access_token = Column(String)  # AES-256-GCM encrypted
-    encrypted_refresh_token = Column(String, nullable=True)
-    encrypted_dek = Column(String)  # Wrapped Data Encryption Key
-    encryption_iv = Column(String)  # Initialization Vector
+    # Encrypted fields for Enterprise Security (Transparent ORM Encryption)
+    encrypted_access_token = Column(EncryptedString)  # Encapsulates ciphertext, DEK, and IV
+    encrypted_refresh_token = Column(EncryptedString, nullable=True)
     
     # Session Metadata
     user_name = Column(String, nullable=True)

@@ -167,6 +167,92 @@ async def get_historical_ohlc(symbol: str, start_date: str, end_date: str, timef
         }
     }
     return payload
+
+@router.get("/historical-regime")
+async def get_historical_regime(symbol: str, start_date: str, end_date: str, timeframe: int = 25):
+    """Fetches historical data, aggregates slots, and performs pandas-based Regime Analysis."""
+    if not state.active_broker:
+        raise HTTPException(status_code=400, detail="No active broker session")
+    
+    from app.core.history_cache import HistoryCache
+    from app.core.regime_analyzer import RegimeAnalyzer
+    import pandas as pd
+    
+    cache = HistoryCache()
+    interval = "1" if state.active_broker_name == "FYERS" else "minute"
+    
+    start_dt = datetime.strptime(start_date, "%Y-%m-%d")
+    end_dt = datetime.strptime(end_date, "%Y-%m-%d").replace(hour=23, minute=59, second=59)
+    if end_dt > datetime.now(): end_dt = datetime.now()
+    
+    missing_ranges = cache.get_missing_ranges(symbol, interval, start_dt, end_dt)
+    for chunk_start, chunk_end in missing_ranges:
+        try:
+            new_candles = await state.active_broker.fetch_history(
+                symbol, interval, 
+                chunk_start.strftime("%Y-%m-%d"), 
+                chunk_end.strftime("%Y-%m-%d")
+            )
+            cache.save_candles(symbol, interval, new_candles)
+        except Exception as e:
+            logging.error(f"Deep fetch chunk error: {e}")
+            
+    raw_candles = cache.get_candles(symbol, interval, int(start_dt.timestamp()), int(end_dt.timestamp()))
+    if not raw_candles:
+        return {"s": "error", "message": "No data found for this range."}
+
+    # Aggregate into slots
+    aggregated_slots = []
+    current_slot = None
+    from datetime import timedelta
+    for c in raw_candles:
+        dt = datetime.fromtimestamp(c["timestamp"])
+        m_start = dt.replace(hour=9, minute=15, second=0, microsecond=0)
+        m_end = dt.replace(hour=15, minute=30, second=0, microsecond=0)
+        if dt < m_start or dt >= m_end: continue
+        
+        diff_minutes = (dt - m_start).total_seconds() / 60
+        slot_idx = int(diff_minutes // timeframe)
+        slot_start_time = m_start + timedelta(minutes=slot_idx * timeframe)
+        
+        label = slot_start_time.strftime("%d-%m-%Y %H:%M")
+        if not current_slot or current_slot["timestamp"] != label:
+            if current_slot: aggregated_slots.append(current_slot)
+            current_slot = {
+                "timestamp": label, "open": c["open"], "high": c["high"], 
+                "low": c["low"], "close": c["close"], "volume": c["volume"]
+            }
+        else:
+            current_slot["high"] = max(current_slot["high"], c["high"])
+            current_slot["low"] = min(current_slot["low"], c["low"])
+            current_slot["close"] = c["close"]
+            current_slot["volume"] += c["volume"]
+    if current_slot: aggregated_slots.append(current_slot)
+    
+    if not aggregated_slots:
+        return {"s": "error", "message": "No valid trading slots found."}
+        
+    df = pd.DataFrame(aggregated_slots)
+    df = RegimeAnalyzer.apply_regime_logic(df)
+    payload = RegimeAnalyzer.generate_dashboard_payload(df)
+    
+    # Enrichment with 52-week benchmarks & LTP
+    payload["summary"]["symbol"] = symbol
+    payload["summary"]["ltp"] = df['close'].iloc[-1] if not df.empty else 0
+    
+    try:
+        quotes = await state.active_broker.get_quotes([symbol])
+        if quotes:
+            q = quotes[0]
+            payload["summary"]["high_52week"] = q.get("high_52week", 0)
+            payload["summary"]["low_52week"] = q.get("low_52week", 0)
+            if q.get("ltp"):
+                payload["summary"]["ltp"] = q.get("ltp")
+    except Exception as e:
+        logging.error(f"Failed to enrich regime payload with 52w benchmarks: {e}")
+    
+    payload["s"] = "ok"
+    return payload
 @router.post("/bulk-phase-scan")
 async def bulk_phase_scan(data: dict):
     """
@@ -348,8 +434,9 @@ async def update_watchlist(data: dict):
     now_ist = datetime.now(ist)
     market_open = now_ist.replace(hour=9, minute=15, second=0, microsecond=0)
     
-    # Pre-initialize the grid structure to ensure immediate render in UI
-    state.aggregator.initialize_symbols(symbols)
+    # --- Session Lifecycle Management ---
+    # 1. Prune stale symbols and initialize new set
+    state.aggregator.set_active_symbols(symbols)
     state._needs_broadcast = True
     # --- Session Lifecycle Management ---
     # 1. Clean Slate: If it's pre-market AM, ensure aggregator is cleared of yesterday's data

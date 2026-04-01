@@ -39,6 +39,8 @@ export const api = {
     setTimeframe: (minutes) => apiRequest('/api/market/set-timeframe', { method: 'POST', body: { minutes } }),
     getHistoricalOHLC: (symbol, start, end, timeframe) => 
         apiRequest(`/api/market/historical-ohlc?symbol=${symbol}&start_date=${start}&end_date=${end}&timeframe=${timeframe}`),
+    getHistoricalRegime: (symbol, start, end, timeframe) => 
+        apiRequest(`/api/market/historical-regime?symbol=${symbol}&start_date=${start}&end_date=${end}&timeframe=${timeframe}`),
     setFeedMode: (mode, date, symbol) => 
         apiRequest('/api/market/set-feed-mode', { method: 'POST', body: { mode, date, symbol } }),
     getSystemLogs: () => apiRequest('/api/market/system-logs'),

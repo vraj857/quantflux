@@ -58,6 +58,14 @@ class IBroker(ABC):
         """Verifies if the current access token is still valid with the broker."""
         pass
 
+    @abstractmethod
+    async def get_quotes(self, symbols: List[str]) -> List[Dict[str, Any]]:
+        """
+        Fetches real-time or last-session quotes (LTP, OHLC, 52W High/Low).
+        Returns a standardized list of quote objects.
+        """
+        pass
+
     @property
     @abstractmethod
     def last_tick_times(self) -> Dict[str, datetime]:

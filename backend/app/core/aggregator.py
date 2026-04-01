@@ -8,6 +8,7 @@ import logging
 import json
 from typing import Dict, List, Optional, Any, Tuple
 from datetime import datetime, time, timedelta
+from sqlalchemy import case, func
 
 # Avoid circular imports
 from app.constants import SLOT_SIZE_MINUTES, TIME_SLOTS_25
@@ -117,6 +118,28 @@ class AggregationEngine:
         self._payload_cache = {"data": {}, "daily_summary": {}}
         self._dirty_symbols.clear()
 
+    def set_active_symbols(self, symbols: List[str]):
+        """
+        Sets the active symbol set for the dashboard.
+        Prunes any symbols from the internal state that are not in the new list.
+        """
+        norm_symbols = [self._normalize_symbol(s) for s in symbols]
+        
+        # 1. Prune Live State: Remove symbols not in the new set
+        current_live_symbols = list(self.live_state.keys())
+        for sym in current_live_symbols:
+            if sym not in norm_symbols:
+                self.live_state.pop(sym, None)
+                self.live_data.pop(sym, None)
+                # Also prune from the high-speed payload cache
+                self._payload_cache["data"].pop(sym, None)
+                self._payload_cache["daily_summary"].pop(sym, None)
+        
+        # 2. Initialize the new set
+        self.initialize_symbols(symbols)
+        
+        logging.info(f"Aggregator: Active symbols updated. Count: {len(self.live_state)}")
+
     def initialize_symbols(self, symbols: List[str]):
         """Pre-populates the live_state keys for the given symbols to ensure the grid renders immediately."""
         logging.info(f"Aggregator: Initializing grid structure for {len(symbols)} symbols.")
@@ -126,6 +149,9 @@ class AggregationEngine:
                 n_slots = len(self.current_slot_labels)
                 self.live_state[norm_sym] = {
                     "price": [None] * n_slots,
+                    "price_open": [None] * n_slots,
+                    "price_high": [None] * n_slots,
+                    "price_low": [None] * n_slots,
                     "price_move": [0.0] * n_slots,
                     "percent_change": [0.0] * n_slots,
                     "volume": [0] * n_slots,
@@ -174,6 +200,9 @@ class AggregationEngine:
             n_slots = len(self.current_slot_labels)
             self.live_state[symbol] = {
                 "price": [None] * n_slots,
+                "price_open": [None] * n_slots,
+                "price_high": [None] * n_slots,
+                "price_low": [None] * n_slots,
                 "price_move": [0.0] * n_slots,
                 "percent_change": [0.0] * n_slots,
                 "volume": [0] * n_slots,
@@ -186,9 +215,17 @@ class AggregationEngine:
         # 1. Update Reference Open (First price of the slot)
         if symbol_data["slot_opens"][slot_idx] is None:
             symbol_data["slot_opens"][slot_idx] = ltp
+            symbol_data["price_open"][slot_idx] = ltp
+            symbol_data["price_high"][slot_idx] = ltp
+            symbol_data["price_low"][slot_idx] = ltp
 
         # 2. Update Primary Metrics
         symbol_data["price"][slot_idx] = ltp
+        # Update High/Low
+        if symbol_data["price_high"][slot_idx] is None or ltp > symbol_data["price_high"][slot_idx]:
+            symbol_data["price_high"][slot_idx] = ltp
+        if symbol_data["price_low"][slot_idx] is None or ltp < symbol_data["price_low"][slot_idx]:
+            symbol_data["price_low"][slot_idx] = ltp
         
         # 3. Update Relative Metrics (Tick-by-Tick logic)
         slot_open = symbol_data["slot_opens"][slot_idx]
@@ -204,10 +241,13 @@ class AggregationEngine:
             symbol_data["volume"][slot_idx] += volume_delta
             symbol_data["last_total_volume"] = total_volume
         
-        # 5. Update Volume Strength (Tick-by-Tick vs Historical average)
-        # Fetch historical average for this symbol/slot if available
-        # This is a simplified version; in production, you'd pull from self.state["history"]
-        pass
+        # 5. Update Volume Strength (Relative to 09:15 Baseline)
+        ref_vol = symbol_data["volume"][0]
+        if ref_vol > 0:
+            vs = round((symbol_data["volume"][slot_idx] / ref_vol) * 100, 2)
+            symbol_data["volume_strength"][slot_idx] = vs
+        else:
+            symbol_data["volume_strength"][slot_idx] = 100.0
 
     async def process_candle(self, symbol: str, candle_1m: Dict) -> Optional[Dict]:
         """Rolls a 1-minute candle into the persistent aggregation state AND the live grid state."""
@@ -267,14 +307,31 @@ class AggregationEngine:
         # 1. Update Reference Open (First price of the slot)
         if symbol_data["slot_opens"][slot_idx] is None:
             symbol_data["slot_opens"][slot_idx] = candle_1m['open']
+            symbol_data["price_open"][slot_idx] = candle_1m['open']
+            symbol_data["price_high"][slot_idx] = candle_1m['high']
+            symbol_data["price_low"][slot_idx] = candle_1m['low']
             
         # 2. Update Primary Metrics
         symbol_data["price"][slot_idx] = ltp
+        # Update High/Low with candle extremes
+        if symbol_data["price_high"][slot_idx] is None or candle_1m['high'] > symbol_data["price_high"][slot_idx]:
+            symbol_data["price_high"][slot_idx] = candle_1m['high']
+        if symbol_data["price_low"][slot_idx] is None or candle_1m['low'] < symbol_data["price_low"][slot_idx]:
+            symbol_data["price_low"][slot_idx] = candle_1m['low']
+
         slot_open = symbol_data["slot_opens"][slot_idx]
         inr_move = round(ltp - slot_open, 2)
         symbol_data["price_move"][slot_idx] = inr_move
         symbol_data["percent_change"][slot_idx] = round((inr_move / slot_open * 100), 2) if slot_open > 0 else 0.0
         symbol_data["volume"][slot_idx] += vol
+
+        # 3. Update Volume Strength (Relative to 09:15 Baseline)
+        ref_vol = symbol_data["volume"][0]
+        if ref_vol > 0:
+            vs = round((symbol_data["volume"][slot_idx] / ref_vol) * 100, 2)
+            symbol_data["volume_strength"][slot_idx] = vs
+        else:
+            symbol_data["volume_strength"][slot_idx] = 100.0
 
         return state["current_slot"]
 
@@ -309,8 +366,8 @@ class AggregationEngine:
                 ).on_conflict_do_update(
                     index_elements=['symbol', 'date', 'slot_label'],
                     set_={
-                        "high": SlotData.high if SlotData.high > slot["high"] else slot["high"],
-                        "low": SlotData.low if SlotData.low < slot["low"] else slot["low"],
+                        "high": case((SlotData.high > slot["high"], SlotData.high), else_=slot["high"]),
+                        "low": case((SlotData.low < slot["low"], SlotData.low), else_=slot["low"]),
                         "close": slot["close"],
                         "volume": slot["volume"],
                         "percent_change": analytics.get("percent_change", 0),
@@ -346,8 +403,8 @@ class AggregationEngine:
                     ).on_conflict_do_update(
                         index_elements=['symbol', 'date', 'slot_label'],
                         set_={
-                            "high": SlotData.high if SlotData.high > slot["high"] else slot["high"],
-                            "low": SlotData.low if SlotData.low < slot["low"] else slot["low"],
+                            "high": case((SlotData.high > slot["high"], SlotData.high), else_=slot["high"]),
+                            "low": case((SlotData.low < slot["low"], SlotData.low), else_=slot["low"]),
                             "close": slot["close"],
                             "volume": slot["volume"],
                             "percent_change": analytics.get("percent_change", 0),
@@ -383,6 +440,9 @@ class AggregationEngine:
             # Update Grid Data Cache
             self._payload_cache["data"][sym] = {
                 "price": data["price"],
+                "price_open": data.get("price_open", []),
+                "price_high": data.get("price_high", []),
+                "price_low": data.get("price_low", []),
                 "price_move": data["price_move"],
                 "percent_change": data["percent_change"],
                 "volume": data["volume"],

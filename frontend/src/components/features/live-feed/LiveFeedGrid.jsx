@@ -27,61 +27,63 @@ const MetricRow = memo(({ symbol, metric, data, isFirst, theme, slotCount, daily
         )}>
             {isFirst && (
                 <td rowSpan={numMetrics} className={clsx(
-                    "p-3 px-4 align-middle border-r min-w-[200px]",
+                    "p-2 px-3 align-middle border-r min-w-[145px] max-w-[160px]",
                     theme === 'dark' ? "border-white/10 bg-black/40" : "border-gray-200 bg-gray-50"
                 )}>
-                    <div className="flex items-center space-x-4">
-                        <div className="flex flex-col shrink-0">
-                            <div className="flex items-center space-x-1.5 mb-1">
+                    <div className="flex flex-col space-y-1">
+                        {/* Row 1: Status + Symbol + Price + % */}
+                        <div className="flex items-center justify-between">
+                            <div className="flex items-center space-x-1.5 overflow-hidden">
                                 <div className={clsx(
                                     "size-1.5 rounded-full flex-shrink-0",
                                     isSubscribed ? "bg-emerald-400 animate-pulse" : "bg-gray-600"
                                 )} />
-                                <span className={clsx(
-                                    "text-[7px] font-black uppercase tracking-widest leading-none opacity-60",
-                                    theme === 'dark' ? "text-indigo-400" : "text-indigo-600"
-                                )}>
-                                    {symbol.includes(':') ? symbol.split(':')[0] : 'NSE'}
+                                <span className={clsx("text-[11px] font-black uppercase tracking-tighter truncate", theme === 'dark' ? "text-white" : "text-gray-900")}>
+                                    {symbol.includes(':') ? symbol.split(':')[1] : symbol}
                                 </span>
                             </div>
-                            <span className={clsx("text-sm font-black tracking-tighter uppercase whitespace-nowrap", theme === 'dark' ? "text-white" : "text-gray-900")}>
-                                {symbol.includes(':') ? symbol.split(':')[1] : symbol}
-                            </span>
-                        </div>
-
-                        <div className={clsx("flex flex-col border-l pl-3 shrink-0", theme === 'dark' ? "border-white/10" : "border-gray-200")}>
-                            <div className="flex items-baseline space-x-1.5 leading-none mb-1">
-                                <span className={clsx("text-xs font-black", theme === 'dark' ? "text-white" : "text-gray-900")}>
+                            <div className="flex items-center space-x-1 shrink-0 ml-1">
+                                <span className={clsx("text-[10px] font-black tabular-nums", theme === 'dark' ? "text-white" : "text-gray-900")}>
                                     ₹{dailySummary?.current_price?.toLocaleString('en-IN')}
                                 </span>
-                                <span className={clsx(
-                                    "text-[9px] font-bold",
-                                    dailySummary?.percent_change > 0 ? "text-emerald-500" : "text-rose-500"
-                                )}>
-                                    {dailySummary?.percent_change > 0 ? '▲' : '▼'}{Math.abs(dailySummary?.percent_change || 0).toFixed(2)}%
+                            </div>
+                        </div>
+
+                        {/* Row 2: Exchange + Vol + PC + INR */}
+                        <div className="flex items-center justify-between opacity-80">
+                            <div className="flex items-center space-x-1.5">
+                                <span className="text-[7px] font-black text-gray-500 uppercase tracking-widest leading-none">
+                                    {symbol.includes(':') ? symbol.split(':')[0] : 'NSE'}
+                                </span>
+                                <span className="text-[8px] font-black text-gray-500 tracking-tighter">
+                                    V:{dailySummary?.total_volume ? (dailySummary.total_volume / 100000).toFixed(1) + 'L' : '0L'}
                                 </span>
                             </div>
-                            <div className="flex items-center space-x-2">
-                                <span className="text-[8px] font-black text-gray-500 uppercase tracking-tighter">
-                                    VOL: {dailySummary?.total_volume?.toLocaleString('en-IN')}
+                            <div className="flex items-center space-x-1.5 shrink-0">
+                                <span className={clsx(
+                                    "text-[8px] font-bold tabular-nums",
+                                    dailySummary?.percent_change > 0 ? "text-emerald-500" : "text-rose-500"
+                                )}>
+                                    {dailySummary?.percent_change > 0 ? '+' : ''}{dailySummary?.percent_change?.toFixed(2)}%
                                 </span>
-                                <span className={clsx("text-[8px] font-black uppercase tracking-tighter", dailySummary?.price_move > 0 ? "text-emerald-500" : "text-rose-500")}>
-                                    INR: {dailySummary?.price_move > 0 ? '+' : ''}{dailySummary?.price_move?.toFixed(2)}
+                                <span className={clsx("text-[8px] font-black tracking-tighter tabular-nums", dailySummary?.price_move > 0 ? "text-emerald-500" : "text-rose-500")}>
+                                    {dailySummary?.price_move > 0 ? '+' : ''}{dailySummary?.price_move?.toFixed(1)}
                                 </span>
                             </div>
                         </div>
 
+                        {/* Row 3: Phase Alerts (Compact inline) */}
                         {data?.phase_alerts && data.phase_alerts.length > 0 && (
-                            <div className="flex flex-col space-y-1 pl-3 border-l border-white/5 ml-auto overflow-hidden">
+                            <div className="flex flex-wrap gap-1 pt-1 border-t border-white/5 opacity-90">
                                 {data.phase_alerts.slice(0, 2).map((alert, idx) => (
                                     <div key={idx} className={clsx(
-                                        "px-2 py-0.5 rounded text-[8px] font-black uppercase tracking-tighter flex items-center space-x-1 animate-in fade-in slide-in-from-right-2",
+                                        "px-1.5 py-0.5 rounded-[3px] text-[7px] font-black uppercase tracking-tight flex items-center space-x-0.5 whitespace-nowrap",
                                         alert.type === 'SIGNAL' ? "bg-emerald-500/20 text-emerald-400 border border-emerald-500/30" :
                                         alert.type === 'RISK' ? "bg-rose-500/20 text-rose-400 border border-rose-500/30" :
                                         "bg-gray-500/10 text-gray-400 border border-white/5"
                                     )}>
-                                        <Zap size={10} className={clsx(alert.type === 'SIGNAL' && "fill-current animate-pulse")} />
-                                        <span className="truncate max-w-[100px]">{alert.msg}</span>
+                                        <Zap size={8} className={clsx(alert.type === 'SIGNAL' && "fill-current animate-pulse")} />
+                                        <span>{alert.msg}</span>
                                     </div>
                                 ))}
                             </div>
@@ -108,6 +110,18 @@ const MetricRow = memo(({ symbol, metric, data, isFirst, theme, slotCount, daily
                 const isPC = metric === "PC %";
                 const isVS = metric === "VS %";
 
+                // Tooltip content for Price row
+                let tooltip = "";
+                if (isPriceRow && val !== undefined && val !== null) {
+                    const o = data.price_open?.[i];
+                    const h = data.price_high?.[i];
+                    const l = data.price_low?.[i];
+                    const c = val;
+                    if (o !== undefined && h !== undefined && l !== undefined) {
+                        tooltip = `O: ${o.toLocaleString('en-IN')} | H: ${h.toLocaleString('en-IN')} | L: ${l.toLocaleString('en-IN')} | C: ${c.toLocaleString('en-IN')}`;
+                    }
+                }
+
                 let sentimentBg = theme === 'dark' ? "bg-zinc-900/40" : "bg-gray-100/60";
                 if (vsVal !== undefined && pcVal !== undefined) {
                     if (vsVal > 120) {
@@ -120,8 +134,12 @@ const MetricRow = memo(({ symbol, metric, data, isFirst, theme, slotCount, daily
                 }
 
                 return (
-                    <td key={i} className={clsx(
+                    <td 
+                        key={i} 
+                        title={tooltip}
+                        className={clsx(
                         "p-2 text-center text-xs font-mono font-bold transition-all border",
+                        isPriceRow && "cursor-help",
                         isPC && val > 0 && "text-emerald-500",
                         isPC && val < 0 && "text-rose-500",
                         isINR && val > 0 && (theme === 'dark' ? "text-emerald-400" : "text-emerald-600"),

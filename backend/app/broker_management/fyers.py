@@ -83,8 +83,8 @@ class FyersAdapter(IBroker):
         return {}
 
     def _normalize_date(self, date_str: str) -> str:
-        """Converts various date formats (DD/MM/YY, DD-MM-YYYY) to YYYY-MM-DD."""
-        for fmt in ("%Y-%m-%d", "%d/%m/%y", "%d/%m/%Y", "%d-%m-%Y"):
+        """Converts various date formats (DD/MM/YY, DD-MM-YYYY, YYYY-MM-DD HH:MM:SS) to YYYY-MM-DD."""
+        for fmt in ("%Y-%m-%d %H:%M:%S", "%Y-%m-%d %H:%M", "%Y-%m-%d", "%d/%m/%y", "%d/%m/%Y", "%d-%m-%Y"):
             try:
                 return datetime.strptime(date_str, fmt).strftime("%Y-%m-%d")
             except ValueError:
@@ -276,8 +276,10 @@ class FyersAdapter(IBroker):
                     "low": q.get("low_price", 0),
                     "close": q.get("prev_close_price", 0),
                     "volume": q.get("volume", 0),
-                    "change": q.get("ch", 0),          # Absolute change
-                    "change_pct": round(q.get("chp", 0), 2)  # % change from prev close
+                    "change": q.get("ch", 0),
+                    "change_pct": round(q.get("chp", 0), 2),
+                    "high_52week": q.get("high_52week", 0),
+                    "low_52week": q.get("low_52week", 0)
                 })
             return results
         except Exception as e:

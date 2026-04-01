@@ -4,6 +4,8 @@ import { clsx } from 'clsx';
 import { api } from '../../../api';
 import BacktestGrid from './BacktestGrid';
 import PhaseAnalyticsDashboard from '../analytics/PhaseAnalyticsDashboard';
+import RegimeDashboard from '../analytics/RegimeDashboard';
+import RegimeWatchlistTable from '../analytics/RegimeWatchlistTable';
 
 const BacktestView = ({ theme, activeView }) => {
     // Mode toggle: 'watchlist' | 'single'
@@ -20,6 +22,8 @@ const BacktestView = ({ theme, activeView }) => {
     const [timeframe, setTimeframe] = useState(25);
     const [gridData, setGridData] = useState(null);
     const [phaseStatsList, setPhaseStatsList] = useState([]);
+    const [regimeData, setRegimeData] = useState(null);
+    const [selectedRegimeSymbol, setSelectedRegimeSymbol] = useState(null);
     const [resultsTab, setResultsTab] = useState('grid');
     const [loading, setLoading] = useState(false);
     const [error, setError] = useState(null);
@@ -68,6 +72,8 @@ const BacktestView = ({ theme, activeView }) => {
         setError(null);
         setGridData(null);
         setPhaseStatsList([]);
+        setRegimeData(null);
+        setSelectedRegimeSymbol(null);
         setResultsTab('grid');
         setProgress('Initializing engine...');
 
@@ -83,6 +89,14 @@ const BacktestView = ({ theme, activeView }) => {
 
                 setGridData(resp.grid_data);
                 if (resp.phase_stats) setPhaseStatsList([{ symbol: selectedSymbol, stats: resp.phase_stats }]);
+                
+                try {
+                    const regimeResp = await api.getHistoricalRegime(selectedSymbol, startDate, endDate, timeframe);
+                    if (regimeResp?.s === 'ok') setRegimeData({ [selectedSymbol]: regimeResp });
+                } catch (e) {
+                    console.error("Failed to fetch regime", e);
+                }
+
                 return;
             }
 
@@ -96,11 +110,17 @@ const BacktestView = ({ theme, activeView }) => {
                 symbols.map(async (sym, index) => {
                     try {
                         const res = await fetchSingle(sym);
+                        let rData = null;
+                        try {
+                            const rResp = await api.getHistoricalRegime(sym, startDate, endDate, timeframe);
+                            if (rResp?.s === 'ok') rData = rResp;
+                        } catch(e) {}
+                        
                         // Progress update (approximate as they run in parallel)
                         if (index % 5 === 0) setProgress(`Processing batch starting at ${index + 1}...`);
-                        return { symbol: sym, data: res };
+                        return { symbol: sym, data: res, regimeData: rData };
                     } catch (e) {
-                        return { symbol: sym, data: null };
+                        return { symbol: sym, data: null, regimeData: null };
                     }
                 })
             );
@@ -108,9 +128,10 @@ const BacktestView = ({ theme, activeView }) => {
             // 3. Optimized Merging (O(n))
             const merged = { data: {}, slot_labels: [] };
             const allPhaseStats = [];
+            const newRegimeMap = {};
             let successCount = 0;
 
-            fetchResults.forEach(({ symbol, data: resp }) => {
+            fetchResults.forEach(({ symbol, data: resp, regimeData }) => {
                 if (resp?.s === 'ok' && resp?.grid_data) {
                     // Lock slot_labels from the first healthy payload
                     if (successCount === 0) merged.slot_labels = resp.grid_data.slot_labels ?? [];
@@ -120,12 +141,18 @@ const BacktestView = ({ theme, activeView }) => {
                     
                     // Collect analytics
                     if (resp.phase_stats) allPhaseStats.push({ symbol, stats: resp.phase_stats });
+                    
+                    // Collect regime math
+                    if (regimeData) newRegimeMap[symbol] = regimeData;
+                    
                     successCount++;
                 }
             });
 
             // 4. Final Commit
             setPhaseStatsList(allPhaseStats);
+            setRegimeData(Object.keys(newRegimeMap).length > 0 ? newRegimeMap : null);
+            
             if (successCount > 0) {
                 setGridData(merged);
                 if (successCount < symbols.length) {
@@ -148,6 +175,8 @@ const BacktestView = ({ theme, activeView }) => {
     const handleModeSwitch = (newMode) => {
         setMode(newMode);
         setGridData(null);
+        setRegimeData(null);
+        setSelectedRegimeSymbol(null);
         setError(null);
     };
 
@@ -343,6 +372,20 @@ const BacktestView = ({ theme, activeView }) => {
                                 <BarChart2 size={11} />
                                 <span>Phase Analysis</span>
                             </button>
+                            <button
+                                onClick={() => setResultsTab('regime')}
+                                disabled={!regimeData}
+                                className={clsx(
+                                    'flex items-center space-x-1.5 px-4 py-1.5 rounded-lg text-[10px] font-black uppercase tracking-widest transition-all',
+                                    resultsTab === 'regime'
+                                        ? 'bg-indigo-600 text-white shadow-md'
+                                        : theme === 'dark' ? 'text-gray-400 hover:text-white' : 'text-gray-500 hover:text-gray-800',
+                                    !regimeData && 'opacity-40 cursor-not-allowed'
+                                )}
+                            >
+                                <TrendingUp size={11} />
+                                <span>Regime Detection</span>
+                            </button>
                         </div>
                     </div>
 
@@ -361,6 +404,35 @@ const BacktestView = ({ theme, activeView }) => {
                                 watchlistName={mode === 'watchlist' ? activeCollection : selectedSymbol}
                                 theme={theme}
                             />
+                        </div>
+                    )}
+
+                    {/* Regime Detection View */}
+                    {resultsTab === 'regime' && (
+                        <div className="flex-1 overflow-auto p-4 max-w-[1600px] mx-auto w-full">
+                            {mode === 'single' || selectedRegimeSymbol ? (
+                                <div className="space-y-4">
+                                    {mode === 'watchlist' && (
+                                        <button 
+                                            onClick={() => setSelectedRegimeSymbol(null)}
+                                            className="px-4 py-2 text-xs font-bold rounded-lg bg-indigo-600/20 text-indigo-400 hover:bg-indigo-600 hover:text-white border border-indigo-500/30 transition-all flex items-center space-x-2"
+                                        >
+                                            <span>← Back to Portfolio Matrix</span>
+                                        </button>
+                                    )}
+                                    <RegimeDashboard 
+                                        data={regimeData?.[mode === 'single' ? selectedSymbol : selectedRegimeSymbol]} 
+                                        isLoading={loading} 
+                                        theme={theme} 
+                                    />
+                                </div>
+                            ) : (
+                                <RegimeWatchlistTable 
+                                    dataMap={regimeData} 
+                                    theme={theme} 
+                                    onSelectSymbol={setSelectedRegimeSymbol} 
+                                />
+                            )}
                         </div>
                     )}
                 </div>

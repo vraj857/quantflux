@@ -14,8 +14,6 @@ from config import (
 from typing import Dict, Any
 from app.infrastructure.logging import ql_logger as logging
 from sqlalchemy import select, update, desc
-from app.infrastructure.security.encryption import security_engine
-from app.services.broker_state import state_store
 from app.infrastructure.audit import audit_log
 from app.workers.reauth import fyers_breaker, zerodha_breaker
 
@@ -52,15 +50,10 @@ async def fyers_callback(auth_code: str = Query(None), db: AsyncSession = Depend
         access_token = await adapter.authenticate({"auth_code": auth_code})
         profile = await adapter.get_profile()
         
-        # 1. Encrypt token for Zero-Trust storage
-        encrypted = security_engine.encrypt(access_token)
-
-        # 2. Persist in DB (Encrypted)
+        # 1. Persist in DB (Transparently Encrypted)
         new_session = BrokerSession(
             broker="FYERS",
-            encrypted_access_token=encrypted["encrypted_data"],
-            encrypted_dek=encrypted["wrapped_dek"],
-            encryption_iv=encrypted["iv"],
+            encrypted_access_token=access_token,
             user_name=profile.get("name"),
             user_id=profile.get("client_id"),
             extra_data=profile,
@@ -98,15 +91,10 @@ async def kite_callback(request_token: str = Query(None), db: AsyncSession = Dep
         access_token = await adapter.authenticate({"request_token": request_token})
         profile = await adapter.get_profile()
         
-        # 1. Encrypt token for Zero-Trust storage
-        encrypted = security_engine.encrypt(access_token)
-
-        # 2. Persist in DB (Encrypted)
+        # 1. Persist in DB (Transparently Encrypted)
         new_session = BrokerSession(
             broker="ZERODHA",
-            encrypted_access_token=encrypted["encrypted_data"],
-            encrypted_dek=encrypted["wrapped_dek"],
-            encryption_iv=encrypted["iv"],
+            encrypted_access_token=access_token,
             user_name=profile.get("name"),
             user_id=profile.get("client_id"),
             session_active=1
@@ -133,15 +121,10 @@ async def set_broker_session(data: Dict[str, Any], db: AsyncSession = Depends(ge
     token = data.get("access_token")
     user_id = data.get("user_id", "default_user") # Assuming a user_id is provided or default
 
-    # 1. Encrypt token for Zero-Trust storage
-    encrypted = security_engine.encrypt(token)
-    
-    # 2. Persist in DB (Encrypted)
+    # 1. Persist in DB (Transparently Encrypted)
     new_session = BrokerSession(
         broker=broker,
-        encrypted_access_token=encrypted["encrypted_data"],
-        encrypted_dek=encrypted["wrapped_dek"],
-        encryption_iv=encrypted["iv"],
+        encrypted_access_token=token,
         user_id=user_id,
         session_active=1
     )
@@ -226,12 +209,8 @@ async def get_session_status(db: AsyncSession = Depends(get_async_db)):
     try:
         from config import FYERS_APP_ID, FYERS_SECRET_KEY, FYERS_REDIRECT_URL, KITE_API_KEY, KITE_API_SECRET
         
-        # 1. Decrypt token using stored metadata
-        decrypted_token = security_engine.decrypt(
-            last_session.encrypted_access_token,
-            last_session.encrypted_dek,
-            last_session.encryption_iv
-        )
+        # 1. Decrypted token is automatically returned by the ORM (Transparent Encryption)
+        decrypted_token = last_session.encrypted_access_token
 
         adapter = None
         if last_session.broker == "FYERS":
@@ -295,14 +274,12 @@ async def get_broker_profile(db: AsyncSession = Depends(get_async_db)):
     from config import FYERS_APP_ID, FYERS_SECRET_KEY, FYERS_REDIRECT_URL, KITE_API_KEY, KITE_API_SECRET
     adapter = None
     if last_session.broker == "FYERS":
-        from fyers_apiv3 import fyersModel
-        adapter = FyersAdapter(FYERS_APP_ID, FYERS_SECRET_KEY, FYERS_REDIRECT_URL)
-        # Decrypt first
-        token = security_engine.decrypt(last_session.encrypted_access_token, last_session.encrypted_dek, last_session.encryption_iv)
+        # Token is automatically decrypted by EncryptedString type
+        token = last_session.encrypted_access_token
         adapter.api = fyersModel.FyersModel(client_id=FYERS_APP_ID, token=token, is_async=False, log_path="")
     elif last_session.broker == "ZERODHA":
         adapter = ZerodhaAdapter(KITE_API_KEY, KITE_API_SECRET)
-        token = security_engine.decrypt(last_session.encrypted_access_token, last_session.encrypted_dek, last_session.encryption_iv)
+        token = last_session.encrypted_access_token
         from kiteconnect import KiteConnect
         adapter.api = KiteConnect(api_key=KITE_API_KEY)
         adapter.api.set_access_token(token)

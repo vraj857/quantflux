@@ -110,6 +110,36 @@ class ZerodhaAdapter(IBroker):
     def is_connected(self) -> bool:
         return self.access_token is not None
 
+    async def get_quotes(self, symbols: List[str]) -> List[Dict[str, Any]]:
+        """Implementation using self.api.quote."""
+        if not self.api: return []
+        await self.rate_limiter.consume()
+        try:
+            # Map back to Kite tokens if passed as strings
+            kite_syms = [int(s) if str(s).isdigit() else s for s in symbols]
+            res = await asyncio.to_thread(self.api.quote, kite_syms)
+            
+            results = []
+            for token, q in res.items():
+                ohlc = q.get("ohlc", {})
+                results.append({
+                    "symbol": str(token),
+                    "ltp": q.get("last_price", 0),
+                    "open": ohlc.get("open", 0),
+                    "high": ohlc.get("high", 0),
+                    "low": ohlc.get("low", 0),
+                    "close": q.get("last_price", 0),
+                    "volume": q.get("volume", 0),
+                    "change": q.get("last_price", 0) - ohlc.get("close", 0),
+                    "change_pct": round(((q.get("last_price", 0) - ohlc.get("close", 0)) / ohlc.get("close", 1)) * 100, 2),
+                    "high_52week": q.get("ohlc", {}).get("high", 0), # Placeholder
+                    "low_52week": q.get("ohlc", {}).get("low", 0)
+                })
+            return results
+        except Exception as e:
+            logging.error(f"Zerodha get_quotes exception: {e}")
+            return []
+
     async def validate_token(self) -> bool:
         try:
             profile = await self.get_profile()
