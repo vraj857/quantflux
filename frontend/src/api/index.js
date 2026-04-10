@@ -41,6 +41,13 @@ export const api = {
         apiRequest(`/api/market/historical-ohlc?symbol=${symbol}&start_date=${start}&end_date=${end}&timeframe=${timeframe}`),
     getHistoricalRegime: (symbol, start, end, timeframe) => 
         apiRequest(`/api/market/historical-regime?symbol=${symbol}&start_date=${start}&end_date=${end}&timeframe=${timeframe}`),
+    getSimulationData: (symbol, start, end, timeframe) =>
+        apiRequest(`/api/market/simulate?symbol=${symbol}&start_date=${start}&end_date=${end}&timeframe=${timeframe}`),
+    getInstrumentInfo: (symbol) =>
+        apiRequest(`/api/market/instrument-info?symbol=${encodeURIComponent(symbol)}`),
+    syncFnoLots: () =>
+        apiRequest('/api/market/sync-fno-lots', { method: 'POST' }),
+
     setFeedMode: (mode, date, symbol) => 
         apiRequest('/api/market/set-feed-mode', { method: 'POST', body: { mode, date, symbol } }),
     getSystemLogs: () => apiRequest('/api/market/system-logs'),

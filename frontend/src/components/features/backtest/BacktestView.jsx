@@ -28,6 +28,7 @@ const BacktestView = ({ theme, activeView }) => {
     const [loading, setLoading] = useState(false);
     const [error, setError] = useState(null);
     const [progress, setProgress] = useState('');
+    const [fetchMeta, setFetchMeta] = useState(null);  // tracks last fetch info
     const [isParametersCollapsed, setIsParametersCollapsed] = useState(false);
 
     // Fetch collection names on mount OR when switching to this view
@@ -75,7 +76,9 @@ const BacktestView = ({ theme, activeView }) => {
         setRegimeData(null);
         setSelectedRegimeSymbol(null);
         setResultsTab('grid');
+        setFetchMeta(null);
         setProgress('Initializing engine...');
+
 
         try {
             // Guard: Single Mode Validation
@@ -88,7 +91,9 @@ const BacktestView = ({ theme, activeView }) => {
                 }
 
                 setGridData(resp.grid_data);
+                if (resp.fetch_meta) setFetchMeta(resp.fetch_meta);
                 if (resp.phase_stats) setPhaseStatsList([{ symbol: selectedSymbol, stats: resp.phase_stats }]);
+
                 
                 try {
                     const regimeResp = await api.getHistoricalRegime(selectedSymbol, startDate, endDate, timeframe);
@@ -307,7 +312,24 @@ const BacktestView = ({ theme, activeView }) => {
                                 {[5, 10, 15, 25, 30, 45, 60].map(t => <option key={t} value={t}>{t} Min</option>)}
                             </select>
                         </div>
-                        <div className="w-44">
+                        <div className="w-44 flex flex-col gap-1">
+                            {/* Fetch Meta — tiny label ABOVE the button */}
+                            <div className={clsx(
+                                'h-[18px] flex items-center gap-1.5 overflow-hidden transition-all',
+                                fetchMeta && !loading
+                                    ? 'opacity-100'
+                                    : 'opacity-0 pointer-events-none'
+                            )}>
+                                {fetchMeta && !loading && (
+                                    <span className="text-[8px] font-black uppercase tracking-wider truncate text-indigo-500/80">
+                                        {fetchMeta.source === 'DB_CACHE' ? 'DB Cache' : 'Broker API'}
+                                        <span className="opacity-50 mx-1">·</span>
+                                        {fetchMeta.elapsed_ms}ms
+                                    </span>
+                                )}
+                            </div>
+
+                            {/* Fetch Button */}
                             <button
                                 onClick={handleFetch}
                                 disabled={loading}
@@ -317,6 +339,7 @@ const BacktestView = ({ theme, activeView }) => {
                                 <span>{loading ? (mode === 'watchlist' ? 'Fetching All...' : 'Fetching...') : 'Fetch Data'}</span>
                             </button>
                         </div>
+
                     </div>
                 </div>
             </div>
@@ -401,6 +424,7 @@ const BacktestView = ({ theme, activeView }) => {
                         <div className="flex-1 overflow-auto p-2">
                             <PhaseAnalyticsDashboard
                                 phaseStats={phaseStatsList}
+                                regimeData={regimeData}
                                 watchlistName={mode === 'watchlist' ? activeCollection : selectedSymbol}
                                 theme={theme}
                             />

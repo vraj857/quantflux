@@ -21,6 +21,7 @@ class Instrument(Base):
     # Metadata
     instrument_type = Column(String)  # "EQ", "FUT", "OPT"
     expiry = Column(String, nullable=True)
+    lot_size = Column(Integer, default=1)  # Default 1 for Equity
     
     __table_args__ = (
         UniqueConstraint('symbol', 'exchange', name='_sym_exch_uc'),

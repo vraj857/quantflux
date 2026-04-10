@@ -91,13 +91,24 @@ class FyersAdapter(IBroker):
                 continue
         return date_str # Fallback
 
+    def _normalize_symbol(self, symbol: str) -> str:
+        """Appends -EQ only for cash stocks, leaving F&O symbols untouched."""
+        if not symbol.startswith("NSE:") or "-" in symbol:
+            return symbol
+            
+        # Use regex to identify F&O (YYYY MMM FUT or YYYY MMM STRIKE CE/PE)
+        import re
+        is_fo = bool(re.search(r"\d{2}[A-Z]{3}(FUT|\d+(CE|PE))$", symbol))
+        if is_fo:
+            return symbol
+            
+        return f"{symbol}-EQ"
+
     async def fetch_history(self, symbol: str, interval: str, start: str, end: str) -> List[Dict[str, Any]]:
         """Standardizes Fyers history response with support for 100-day chunking."""
         await self.rate_limiter.consume()
         
-        fyers_symbol = symbol
-        if fyers_symbol.startswith("NSE:") and "-" not in fyers_symbol:
-            fyers_symbol = f"{fyers_symbol}-EQ"
+        fyers_symbol = self._normalize_symbol(symbol)
             
         start_date = datetime.strptime(self._normalize_date(start), "%Y-%m-%d")
         end_date = datetime.strptime(self._normalize_date(end), "%Y-%m-%d")
@@ -160,9 +171,7 @@ class FyersAdapter(IBroker):
         self.symbols_to_subscribe = []
         self._reverse_symbol_map = {}
         for sym in symbols:
-            fyers_sym = sym
-            if sym.startswith("NSE:") and "-" not in sym:
-                fyers_sym = f"{sym}-EQ"
+            fyers_sym = self._normalize_symbol(sym)
             self.symbols_to_subscribe.append(fyers_sym)
             self._reverse_symbol_map[fyers_sym] = sym
         
@@ -247,9 +256,7 @@ class FyersAdapter(IBroker):
         fyers_syms = []
         reverse_map = {}
         for sym in symbols:
-            f_sym = sym
-            if sym.startswith("NSE:") and "-" not in sym:
-                f_sym = f"{sym}-EQ"
+            f_sym = self._normalize_symbol(sym)
             fyers_syms.append(f_sym)
             reverse_map[f_sym] = sym
 

@@ -2,12 +2,15 @@ import React, { useMemo } from 'react';
 import { clsx } from 'clsx';
 import { Activity, Info, Zap } from 'lucide-react';
 import { PHASE_NAMES, PHASE_LABELS } from '../../../constants';
-import PhaseStatTable from './PhaseStatTable';
+import MicrostructureChart from './MicrostructureChart';
+import { ShapeProbabilityChart } from './ShapeProbabilityChart';
+import { IntradayBlueprintGrid } from './IntradayBlueprintGrid';
+import WatchlistScreenerTable from './WatchlistScreenerTable';
 
 // ─────────────────────────────────────────────────────────────────────────────
 // MAIN COMPONENT
 // ─────────────────────────────────────────────────────────────────────────────
-const PhaseAnalyticsDashboard = ({ phaseStats, watchlistName, theme }) => {
+const PhaseAnalyticsDashboard = ({ phaseStats, regimeData, watchlistName, theme }) => {
     const [selectedSymbol, setSelectedSymbol] = React.useState('Aggregate');
 
     // Extract available symbols for manual selection
@@ -16,6 +19,21 @@ const PhaseAnalyticsDashboard = ({ phaseStats, watchlistName, theme }) => {
         return phaseStats.map(s => s.symbol).filter(Boolean);
     }, [phaseStats]);
 
+    // Automatically select the real symbol if 'single' mode is active and the dropdown is hidden
+    const effectiveSymbol = useMemo(() => {
+        if (availableSymbols.length === 1) return availableSymbols[0];
+        return selectedSymbol;
+    }, [availableSymbols, selectedSymbol]);
+
+    // Extract Microstructure Data for specific symbol
+    const microstructureData = useMemo(() => {
+        if (!regimeData) return null;
+        if (effectiveSymbol !== 'Aggregate') {
+            return regimeData[effectiveSymbol]?.microstructure || null;
+        }
+        return null;
+    }, [regimeData, effectiveSymbol]);
+
     // Compute stats based on selection (Aggregate or Specific Symbol)
     const mergedStats = useMemo(() => {
         if (!phaseStats || phaseStats.length === 0) return null;
@@ -23,8 +41,8 @@ const PhaseAnalyticsDashboard = ({ phaseStats, watchlistName, theme }) => {
         const statsList = Array.isArray(phaseStats) ? phaseStats : [phaseStats];
         
         // CASE 1: Individual Symbol Selection
-        if (selectedSymbol !== 'Aggregate') {
-            const match = statsList.find(s => s.symbol === selectedSymbol);
+        if (effectiveSymbol !== 'Aggregate') {
+            const match = statsList.find(s => s.symbol === effectiveSymbol);
             return match ? match.stats : null;
         }
 
@@ -46,34 +64,13 @@ const PhaseAnalyticsDashboard = ({ phaseStats, watchlistName, theme }) => {
         return merged;
     }, [phaseStats, selectedSymbol]);
 
-    const [isSaving, setIsSaving] = React.useState(false);
-    const [saveSuccess, setSaveSuccess] = React.useState(false);
+    const [activeChartTab, setActiveChartTab] = React.useState('microstructure');
 
-    const handleSaveDNA = async () => {
-        const targetSymbol = selectedSymbol === 'Aggregate' ? watchlistName : selectedSymbol;
-        if (!targetSymbol || !mergedStats) return;
-        
-        setIsSaving(true);
-        try {
-            const response = await fetch('/api/market/save-phase-dna', {
-                method: 'POST',
-                headers: { 'Content-Type': 'application/json' },
-                body: JSON.stringify({
-                    symbol: targetSymbol,
-                    benchmarks: mergedStats,
-                    period: selectedSymbol === 'Aggregate' ? `Watchlist: ${watchlistName}` : 'Quantitative Analysis'
-                }),
-            });
-            if (response.ok) {
-                setSaveSuccess(true);
-                setTimeout(() => setSaveSuccess(false), 3000);
-            }
-        } catch (err) {
-            console.error('Failed to save DNA:', err);
-        } finally {
-            setIsSaving(false);
-        }
-    };
+    const chartTabs = [
+        { id: 'microstructure', label: 'Normalized Microstructure', show: !!microstructureData },
+        { id: 'probability', label: 'Shape Probability', show: !!microstructureData?.Probability_Stats },
+        { id: 'blueprint', label: 'Intraday Blueprint', show: !!microstructureData?.Blueprint_Data }
+    ].filter(t => t.show);
 
     if (!mergedStats) {
         return (
@@ -87,92 +84,87 @@ const PhaseAnalyticsDashboard = ({ phaseStats, watchlistName, theme }) => {
     }
 
     return (
-        <div className='flex flex-col gap-6 pb-10'>
-
-            {/* Page header */}
-            <div className={clsx('rounded-2xl border p-5 relative overflow-hidden', theme === 'dark' ? 'bg-zinc-950/50 border-white/5' : 'bg-indigo-50/60 border-indigo-100')}>
-                
-                <div className='flex justify-between items-start'>
-                    <div className='flex-1'>
-                        <div className='flex items-center gap-3 mb-1'>
-                            <h2 className={clsx('text-xl font-black uppercase italic tracking-tight', theme === 'dark' ? 'text-white' : 'text-gray-900')}>
-                                Quantitative <span className='text-indigo-400'>Phase Analysis</span>
-                            </h2>
-                            
-                            {/* Symbol Selector Dropdown */}
-                            {availableSymbols.length > 1 && (
-                                <div className='ml-4 flex items-center gap-2'>
-                                    <span className='text-[9px] font-black uppercase text-gray-500 tracking-widest'>View:</span>
-                                    <select
-                                        value={selectedSymbol}
-                                        onChange={(e) => setSelectedSymbol(e.target.value)}
-                                        className={clsx(
-                                            'px-3 py-1 rounded-lg text-[10px] font-black uppercase tracking-tight border outline-none transition-all',
-                                            theme === 'dark' ? 'bg-black border-white/10 text-indigo-400' : 'bg-white border-gray-200 text-indigo-600'
-                                        )}
-                                    >
-                                        <option value="Aggregate">Portfolio Average</option>
-                                        {availableSymbols.map(sym => (
-                                            <option key={sym} value={sym}>{sym}</option>
-                                        ))}
-                                    </select>
-                                </div>
+        <div className='flex flex-col gap-4 pb-10'>
+            {/* Minimal Symbol Selector & Local Tabs */}
+            <div className={clsx('flex items-center justify-between border-b px-2 pb-0', theme === 'dark' ? 'border-white/5' : 'border-gray-200')}>
+                {/* Horizontal Chart Tabs */}
+                <div className='flex items-center -mb-px'>
+                    {chartTabs.map((tab) => (
+                        <button
+                            key={tab.id}
+                            onClick={() => setActiveChartTab(tab.id)}
+                            className={clsx(
+                                'px-4 py-3 text-[10px] font-black uppercase tracking-widest border-b-2 transition-all outline-none whitespace-nowrap',
+                                activeChartTab === tab.id
+                                    ? 'border-indigo-500 text-indigo-400'
+                                    : 'border-transparent text-gray-500 hover:text-gray-400'
                             )}
-                        </div>
-                        
-                        <p className={clsx('text-[10px] font-medium leading-relaxed max-w-2xl', theme === 'dark' ? 'text-gray-400' : 'text-gray-500')}>
-                            {selectedSymbol === 'Aggregate' 
-                                ? `Portfolio-wide analysis of ${watchlistName} performance across 4 strict intraday time phases.` 
-                                : `Expert analysis of ${selectedSymbol} performance across 4 strict intraday time phases.`
-                            }
-                        </p>
+                        >
+                            {tab.label}
+                        </button>
+                    ))}
+                </div>
+
+                {/* Symbol Selector */}
+                {availableSymbols.length > 1 && (
+                    <div className='flex items-center gap-2 pr-2'>
+                        <span className='text-[10px] font-black uppercase text-gray-500 tracking-widest leading-none'>SYMBOL:</span>
+                        <select
+                            value={selectedSymbol}
+                            onChange={(e) => setSelectedSymbol(e.target.value)}
+                            className={clsx(
+                                'px-3 py-1 rounded-lg text-[10px] font-black uppercase tracking-tight border outline-none transition-all',
+                                theme === 'dark' ? 'bg-black border-white/10 text-indigo-400' : 'bg-white border-gray-200 text-indigo-600'
+                            )}
+                        >
+                            <option value="Aggregate">Portfolio Average</option>
+                            {availableSymbols.map(sym => (
+                                <option key={sym} value={sym}>{sym}</option>
+                            ))}
+                        </select>
                     </div>
+                )}
+            </div>
 
-                    <button
-                        onClick={handleSaveDNA}
-                        disabled={isSaving}
-                        className={clsx(
-                            'group relative flex items-center gap-2 px-4 py-2 rounded-xl text-[10px] font-black uppercase tracking-widest transition-all active:scale-95 disabled:grayscale',
-                            saveSuccess 
-                                ? 'bg-emerald-500 text-white shadow-[0_0_20px_rgba(16,185,129,0.3)]' 
-                                : theme === 'dark' 
-                                    ? 'bg-indigo-500/20 text-indigo-400 border border-indigo-500/30 hover:bg-indigo-500 hover:text-white' 
-                                    : 'bg-indigo-600 text-white hover:bg-indigo-700'
-                        )}
-                    >
-                        {isSaving ? (
-                            <div className='size-3 border-2 border-current border-t-transparent rounded-full animate-spin' />
-                        ) : saveSuccess ? (
-                            <Activity size={12} className='animate-bounce' />
-                        ) : (
-                            <Zap size={12} className='group-hover:animate-pulse' />
-                        )}
-                        <span>{isSaving ? 'Exporting...' : saveSuccess ? 'DNA Exported!' : 'Sync to Live Sentinel'}</span>
-                    </button>
+            {/* Chart Area */}
+            {microstructureData && effectiveSymbol !== 'Aggregate' ? (
+                <div className="flex flex-col gap-4 animate-in fade-in duration-300">
+                    {activeChartTab === 'microstructure' && (
+                        <div className={clsx('rounded-2xl border p-1', theme === 'dark' ? 'bg-zinc-950/50 border-white/5' : 'bg-white border-gray-200')}>
+                            <MicrostructureChart data={microstructureData} theme={theme} />
+                        </div>
+                    )}
+                    
+                    {activeChartTab === 'probability' && microstructureData.Probability_Stats && (
+                        <div className="animate-in slide-in-from-bottom-2 duration-300">
+                            <ShapeProbabilityChart data={microstructureData.Probability_Stats} theme={theme} />
+                        </div>
+                    )}
+                    
+                    {activeChartTab === 'blueprint' && microstructureData.Blueprint_Data && (
+                        <div className="animate-in slide-in-from-bottom-2 duration-300">
+                            <IntradayBlueprintGrid data={microstructureData} theme={theme} />
+                        </div>
+                    )}
                 </div>
-            </div>
-
-            {/* Expert Analysis Table */}
-            <div className={clsx('rounded-2xl border p-1', theme === 'dark' ? 'bg-zinc-950/50 border-white/5' : 'bg-white border-gray-200')}>
-                <PhaseStatTable stats={mergedStats} theme={theme} />
-            </div>
-
-            {/* Analyst Methodology Note */}
-            <div className={clsx(
-                'flex items-start gap-4 p-5 rounded-2xl border border-dashed',
-                theme === 'dark' ? 'bg-black/40 border-white/10 text-gray-400' : 'bg-gray-50 border-gray-300 text-gray-600'
-            )}>
-                <Info size={20} className='text-indigo-400 shrink-0' />
-                <div className='space-y-2'>
-                    <h4 className='text-[11px] font-black uppercase tracking-widest text-indigo-400'>Methodology Note</h4>
-                    <p className='text-[10px] leading-relaxed'>
-                        <strong>Trend Efficiency:</strong> Calculated as (Absolute Directional Move / Sum of Absolute Interval Moves). A score of 1.0 indicates a perfectly linear trend, while &lt; 0.3 indicates high noise/chop.
-                    </p>
-                    <p className='text-[10px] leading-relaxed'>
-                        <strong>Deductions:</strong> The Recommended Trading Style and Key Characteristics are automatically deduced using institutional benchmarks for volatility, participation, and persistence.
+            ) : effectiveSymbol === 'Aggregate' && regimeData ? (
+                <div className="animate-in fade-in duration-300">
+                    <WatchlistScreenerTable 
+                        phaseStats={phaseStats}
+                        regimeData={regimeData} 
+                        watchlistName={watchlistName} 
+                        onSelectSymbol={setSelectedSymbol}
+                        theme={theme} 
+                    />
+                </div>
+            ) : (
+                <div className="flex flex-col items-center justify-center h-64 opacity-20 select-none">
+                    <Activity size={48} className="text-indigo-500 mb-4" />
+                    <p className="text-xs font-black uppercase tracking-[0.2em] text-center">
+                        Select a specific symbol to view Microstructure detail
                     </p>
                 </div>
-            </div>
+            )}
         </div>
     );
 };

@@ -258,7 +258,22 @@ async def get_session_status(db: AsyncSession = Depends(get_async_db)):
 @router.get("/profile")
 async def get_broker_profile(db: AsyncSession = Depends(get_async_db)):
     """Returns the user profile from the most recent active broker session."""
-    from sqlalchemy import select
+    # 1. Fast path: check in-memory state first
+    if state.active_broker is not None:
+        try:
+            # We don't want to hit the broker API here every time to save latency,
+            # so we just return what we have if the token is likely still valid.
+            # get_session_status handles the actual validation.
+            return {
+                "authenticated": True,
+                "broker": state.active_broker_name,
+                "user_name": state.active_broker.profile.get("name") if hasattr(state.active_broker, 'profile') and state.active_broker.profile else None,
+                "user_id": state.active_broker.client_id if hasattr(state.active_broker, 'client_id') else None
+            }
+        except Exception:
+            pass
+
+    # 2. Slow path: Restore from DB
     result = await db.execute(
         select(BrokerSession)
         .where(BrokerSession.session_active == 1)
@@ -270,29 +285,14 @@ async def get_broker_profile(db: AsyncSession = Depends(get_async_db)):
     if not last_session:
         return {"authenticated": False, "user_name": None, "user_id": None, "broker": None}
 
-    # Ensure it's still valid
-    from config import FYERS_APP_ID, FYERS_SECRET_KEY, FYERS_REDIRECT_URL, KITE_API_KEY, KITE_API_SECRET
-    adapter = None
-    if last_session.broker == "FYERS":
-        # Token is automatically decrypted by EncryptedString type
-        token = last_session.encrypted_access_token
-        adapter.api = fyersModel.FyersModel(client_id=FYERS_APP_ID, token=token, is_async=False, log_path="")
-    elif last_session.broker == "ZERODHA":
-        adapter = ZerodhaAdapter(KITE_API_KEY, KITE_API_SECRET)
-        token = last_session.encrypted_access_token
-        from kiteconnect import KiteConnect
-        adapter.api = KiteConnect(api_key=KITE_API_KEY)
-        adapter.api.set_access_token(token)
-
-    if adapter and await validate_and_cleanup_session(adapter, last_session.id, db):
-        return {
-            "authenticated": True,
-            "broker": last_session.broker,
-            "user_name": last_session.user_name,
-            "user_id": last_session.user_id,
-        }
-    
-    return {"authenticated": False, "user_name": None, "user_id": None, "broker": None}
+    # 3. Simple verification: if we have the data in DB and it's marked active, return it.
+    # The frontend calls /status for hard validation, /profile is for UI display.
+    return {
+        "authenticated": True,
+        "broker": last_session.broker,
+        "user_name": last_session.user_name,
+        "user_id": last_session.user_id,
+    }
 
 @router.post("/logout")
 async def logout(db: AsyncSession = Depends(get_async_db)):

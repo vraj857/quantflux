@@ -196,19 +196,22 @@ const BacktestGrid = ({ data, theme }) => {
     }, [unifiedTimes, theme]);
 
     const downloadCSV = () => {
-        let csv = 'Date,Time,Symbol,Price,INR,PC %,Volume,VS %\n';
+        let csv = 'Date,Time,Symbol,Open,High,Low,Close,INR,PC %,Volume,VS %\n';
         symbols.forEach(sym => {
             const symData = data.data[sym];
             dates.forEach(dateStr => {
                 unifiedTimes.forEach(timeKey => {
                     const idx = timeMap[dateStr][timeKey];
                     if (idx !== undefined) {
-                        const price = symData.price?.[idx] || 0;
+                        const open = symData.price_open?.[idx] || 0;
+                        const high = symData.price_high?.[idx] || 0;
+                        const low = symData.price_low?.[idx] || 0;
+                        const close = symData.price?.[idx] || 0;
                         const inr = symData.price_move?.[idx] || 0;
                         const pc = symData.percent_change?.[idx] || 0;
                         const vol = symData.volume?.[idx] || 0;
                         const vs = symData.volume_strength?.[idx] || 0;
-                        csv += `${dateStr},${timeKey},${sym},${price},${inr},${pc},${vol},${vs}\n`;
+                        csv += `${dateStr},${timeKey},${sym},${open},${high},${low},${close},${inr},${pc},${vol},${vs}\n`;
                     }
                 });
             });

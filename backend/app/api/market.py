@@ -43,284 +43,420 @@ async def set_timeframe(data: TimeframeUpdate):
 
 @router.get("/historical-ohlc")
 async def get_historical_ohlc(symbol: str, start_date: str, end_date: str, timeframe: int = 25):
-    """Fetches historical OHLC with local caching and deep scaling."""
+    """Fetches historical OHLC. Persists per-timeframe candles in historical_data.db.
+    
+    Flow:
+      1. Check coverage_map for cached date range.
+      2. Fetch ONLY missing gaps from broker (raw 1-min).
+      3. Aggregate 1-min → N-min and persist in ohlcv_candles.
+      4. Serve the full requested window from DB — zero redundant broker calls.
+    """
     if not state.active_broker:
         raise HTTPException(status_code=400, detail="No active broker session")
-    
-    from app.core.history_cache import HistoryCache
-    cache = HistoryCache()
-    interval = "1" if state.active_broker_name == "FYERS" else "minute"
-    
+
+    from app.core.historical_store import HistoricalDataStore
+    import time
+    t_start = time.perf_counter()
+
+    store = HistoricalDataStore()
+    broker_interval = "1" if state.active_broker_name == "FYERS" else "minute"
+
     start_dt = datetime.strptime(start_date, "%Y-%m-%d")
-    end_dt = datetime.strptime(end_date, "%Y-%m-%d").replace(hour=23, minute=59, second=59)
-    
-    # Cap end_dt at now to avoid gaps for the future part of today
-    now = datetime.now()
+    end_dt   = datetime.strptime(end_date, "%Y-%m-%d").replace(hour=23, minute=59, second=59)
+    now      = datetime.now()
     if end_dt > now:
         end_dt = now
-    
-    # 1. Identify missing ranges
-    missing_ranges = cache.get_missing_ranges(symbol, interval, start_dt, end_dt)
-    
-    # 2. Fetch missing chunks from broker
-    for chunk_start, chunk_end in missing_ranges:
+
+    # 1. Identify what's missing
+    gaps = store.get_missing_gaps(symbol, timeframe, start_dt, end_dt)
+    gaps_filled = 0
+    source = "DB_CACHE"
+    gap_summary = []
+    for gs, ge in gaps:
+        gap_summary.append(f"{gs.date()} to {ge.date()}")
+
+    # 2. Fetch & store only the gaps
+    for gap_start, gap_end in gaps:
         try:
-            # Note: For very long ranges, we would further chunk this into 60-day blocks
-            # if the broker adaptor doesn't already handle it.
-            new_candles = await state.active_broker.fetch_history(
-                symbol, interval, 
-                chunk_start.strftime("%Y-%m-%d"), 
-                chunk_end.strftime("%Y-%m-%d")
+            raw = await state.active_broker.fetch_history(
+                symbol, broker_interval,
+                gap_start.strftime("%Y-%m-%d"),
+                gap_end.strftime("%Y-%m-%d"),
             )
-            cache.save_candles(symbol, interval, new_candles)
+            if raw:
+                agg = HistoricalDataStore.aggregate_raw_to_slots(raw, timeframe)
+                store.save_aggregated_candles(symbol, timeframe, agg)
+                store.update_coverage(symbol, timeframe, gap_start, gap_end)
+                gaps_filled += 1
+                source = "BROKER_API"
+                logging.info(
+                    f"[BROKER_API] {symbol} | tf={timeframe}m | "
+                    f"gap: {gap_start.date()} → {gap_end.date()} | "
+                    f"stored {len(agg)} candles"
+                )
         except Exception as e:
-            logging.error(f"Deep fetch chunk error: {e}")
-            
-    # 3. Pull final combined list from Cache
-    raw_candles = cache.get_candles(symbol, interval, int(start_dt.timestamp()), int(end_dt.timestamp()))
-    
-    if not raw_candles:
+            logging.error(f"[HistoricalStore] Gap fetch error {symbol}: {e}")
+
+    # 3. Read the full range from DB
+    aggregated_slots_raw = store.get_candles(symbol, timeframe, start_dt, end_dt)
+    if not aggregated_slots_raw:
         return {"s": "error", "message": "No data found for this range."}
 
-    aggregated_slots = []
-    current_slot = None
-    
-    from datetime import timedelta
-    for c in raw_candles:
-        # DB stores integer timestamps
-        dt = datetime.fromtimestamp(c["timestamp"])
-            
-        m_start = dt.replace(hour=9, minute=15, second=0, microsecond=0)
-        m_end = dt.replace(hour=15, minute=30, second=0, microsecond=0)
-        if dt < m_start or dt >= m_end: continue
-        
-        diff_minutes = (dt - m_start).total_seconds() / 60
-        slot_idx = int(diff_minutes // timeframe)
-        slot_start_time = m_start + timedelta(minutes=slot_idx * timeframe)
-        label = slot_start_time.strftime("%d-%m-%Y %H:%M")
-        
-        if not current_slot or current_slot["label"] != label:
-            if current_slot: aggregated_slots.append(current_slot)
-            current_slot = {
-                "label": label,
-                "epoch": int(slot_start_time.timestamp()),
-                "open": c["open"],
-                "high": c["high"],
-                "low": c["low"],
-                "close": c["close"],
-                "volume": c["volume"]
-            }
-        else:
-            current_slot["high"] = max(current_slot["high"], c["high"])
-            current_slot["low"] = min(current_slot["low"], c["low"])
-            current_slot["close"] = c["close"]
-            current_slot["volume"] += c["volume"]
-            
-    if current_slot: aggregated_slots.append(current_slot)
-    
-    plotly_candles, prices, pcs, inr_moves, vols, vss, labels = [], [], [], [], [], [], []
+    elapsed_ms = round((time.perf_counter() - t_start) * 1000)
+    fetched_at = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+
+    if source == "DB_CACHE":
+        logging.info(
+            f"[DB_CACHE] {symbol} | tf={timeframe}m | "
+            f"{len(aggregated_slots_raw)} candles | "
+            f"{start_date} → {end_date} | {elapsed_ms}ms"
+        )
+
+    # Convert DB rows → legacy aggregated_slots format for downstream
+    aggregated_slots = [
+        {
+            "label": datetime.fromtimestamp(r["ts"]).strftime("%d-%m-%Y %H:%M"),
+            "epoch": r["ts"],
+            "open":  r["open"],
+            "high":  r["high"],
+            "low":   r["low"],
+            "close": r["close"],
+            "volume": r["volume"],
+        }
+        for r in aggregated_slots_raw
+    ]
+
+    # 4. Build response payload
+    plotly_candles, prices, opens, highs, lows, pcs, inr_moves, vols, vss, labels = [], [], [], [], [], [], [], [], [], []
     for idx, s in enumerate(aggregated_slots):
         plotly_candles.append([s["epoch"], s["open"], s["high"], s["low"], s["close"], s["volume"]])
         labels.append(s["label"])
         prices.append(s["close"])
+        opens.append(s["open"])
+        highs.append(s["high"])
+        lows.append(s["low"])
         vols.append(s["volume"])
-        
+
         inr_move = round(s["close"] - s["open"], 2)
         inr_moves.append(inr_move)
-        
+
         pc = round((inr_move / s["open"]) * 100, 2) if s["open"] > 0 else 0.0
         pcs.append(pc)
-        
+
         slot_dt = datetime.fromtimestamp(s["epoch"])
         if slot_dt.hour == 9 and slot_dt.minute == 15:
             vs = 100.0
         else:
-            # Trailing avg for volume strength
             past_vols = [h["volume"] for h in aggregated_slots[:idx]]
-            avg = sum(past_vols[-20:])/len(past_vols[-20:]) if past_vols else s["volume"]
+            avg = sum(past_vols[-20:]) / len(past_vols[-20:]) if past_vols else s["volume"]
             vs = round((s["volume"] / avg) * 100, 2) if avg > 0 else 100.0
         vss.append(vs)
 
     from app.core.phases import PhaseEngine
     phase_stats = PhaseEngine.calculate_stats(aggregated_slots)
-        
-    payload = {
+
+    return {
         "s": "ok",
         "candles": plotly_candles,
         "phase_stats": phase_stats,
+        "cache_info": store.get_coverage_info(symbol, timeframe),
+        "fetch_meta": {
+            "source": source,
+            "fetched_at": fetched_at,
+            "elapsed_ms": elapsed_ms,
+            "candle_count": len(aggregated_slots_raw),
+            "gaps_filled": gaps_filled,
+            "sync_details": gap_summary if gap_summary else "Synchronized (Full Cache Hit)",
+            "symbol": symbol,
+            "timeframe": timeframe,
+        },
         "grid_data": {
             "data": {symbol: {
-                "price": prices, 
-                "price_move": inr_moves,
-                "percent_change": pcs, 
-                "volume": vols, 
-                "volume_strength": vss
+                "price":          prices,
+                "price_open":     opens,
+                "price_high":     highs,
+                "price_low":      lows,
+                "price_move":     inr_moves,
+                "percent_change": pcs,
+                "volume":         vols,
+                "volume_strength": vss,
             }},
             "slot_labels": labels,
             "daily_summary": {symbol: {
-                "current_price": prices[-1] if prices else 0,
-                "percent_change": pcs[-1] if pcs else 0, 
-                "total_volume": sum(vols),
-                "price_move": round(prices[-1] - aggregated_slots[0]["open"], 2) if prices and aggregated_slots else 0
+                "current_price":  prices[-1] if prices else 0,
+                "percent_change": pcs[-1] if pcs else 0,
+                "total_volume":   sum(vols),
+                "price_move":     round(prices[-1] - aggregated_slots[0]["open"], 2) if prices and aggregated_slots else 0,
             }},
-            "phases": [{"name": f"{timeframe}m Setup", "colSpan": len(labels), "bg": "bg-indigo-500/10 text-indigo-500"}]
-        }
+            "phases": [{"name": f"{timeframe}m Setup", "colSpan": len(labels), "bg": "bg-indigo-500/10 text-indigo-500"}],
+        },
     }
-    return payload
 
-@router.get("/historical-regime")
-async def get_historical_regime(symbol: str, start_date: str, end_date: str, timeframe: int = 25):
-    """Fetches historical data, aggregates slots, and performs pandas-based Regime Analysis."""
+
+@router.get("/simulate")
+async def get_simulation_data(symbol: str, start_date: str, end_date: str, timeframe: int = 25):
+    """
+    Returns per-day slot data with cumulative VWAP for client-side strategy simulation.
+
+    Response: { sim_data: { days: [{ date, slots: { "HH:MM": { price, open, high, low, vwap, volume }, "NextDayOpen": { price } } }] } }
+    """
     if not state.active_broker:
         raise HTTPException(status_code=400, detail="No active broker session")
-    
-    from app.core.history_cache import HistoryCache
-    from app.core.regime_analyzer import RegimeAnalyzer
-    import pandas as pd
-    
-    cache = HistoryCache()
-    interval = "1" if state.active_broker_name == "FYERS" else "minute"
-    
+
+    from app.core.historical_store import HistoricalDataStore
+    from collections import defaultdict
+    import time
+
+    t_start = time.perf_counter()
+    store = HistoricalDataStore()
+    broker_interval = "1" if state.active_broker_name == "FYERS" else "minute"
+
     start_dt = datetime.strptime(start_date, "%Y-%m-%d")
-    end_dt = datetime.strptime(end_date, "%Y-%m-%d").replace(hour=23, minute=59, second=59)
-    if end_dt > datetime.now(): end_dt = datetime.now()
-    
-    missing_ranges = cache.get_missing_ranges(symbol, interval, start_dt, end_dt)
-    for chunk_start, chunk_end in missing_ranges:
+    end_dt   = datetime.strptime(end_date, "%Y-%m-%d").replace(hour=23, minute=59, second=59)
+    if end_dt > datetime.now():
+        end_dt = datetime.now()
+
+    # Gap-fill — same smart logic as /historical-ohlc
+    gaps = store.get_missing_gaps(symbol, timeframe, start_dt, end_dt)
+    source = "DB_CACHE"
+    for gap_start, gap_end in gaps:
         try:
-            new_candles = await state.active_broker.fetch_history(
-                symbol, interval, 
-                chunk_start.strftime("%Y-%m-%d"), 
-                chunk_end.strftime("%Y-%m-%d")
+            raw = await state.active_broker.fetch_history(
+                symbol, broker_interval,
+                gap_start.strftime("%Y-%m-%d"),
+                gap_end.strftime("%Y-%m-%d"),
             )
-            cache.save_candles(symbol, interval, new_candles)
+            if raw:
+                agg = HistoricalDataStore.aggregate_raw_to_slots(raw, timeframe)
+                store.save_aggregated_candles(symbol, timeframe, agg)
+                store.update_coverage(symbol, timeframe, gap_start, gap_end)
+                source = "BROKER_API"
         except Exception as e:
-            logging.error(f"Deep fetch chunk error: {e}")
-            
-    raw_candles = cache.get_candles(symbol, interval, int(start_dt.timestamp()), int(end_dt.timestamp()))
-    if not raw_candles:
+            logging.error(f"[Simulate] gap fetch error {symbol}: {e}")
+
+    candles = store.get_candles(symbol, timeframe, start_dt, end_dt)
+    if not candles:
         return {"s": "error", "message": "No data found for this range."}
 
-    # Aggregate into slots
-    aggregated_slots = []
-    current_slot = None
-    from datetime import timedelta
-    for c in raw_candles:
-        dt = datetime.fromtimestamp(c["timestamp"])
-        m_start = dt.replace(hour=9, minute=15, second=0, microsecond=0)
-        m_end = dt.replace(hour=15, minute=30, second=0, microsecond=0)
-        if dt < m_start or dt >= m_end: continue
-        
-        diff_minutes = (dt - m_start).total_seconds() / 60
-        slot_idx = int(diff_minutes // timeframe)
-        slot_start_time = m_start + timedelta(minutes=slot_idx * timeframe)
-        
-        label = slot_start_time.strftime("%d-%m-%Y %H:%M")
-        if not current_slot or current_slot["timestamp"] != label:
-            if current_slot: aggregated_slots.append(current_slot)
-            current_slot = {
-                "timestamp": label, "open": c["open"], "high": c["high"], 
-                "low": c["low"], "close": c["close"], "volume": c["volume"]
+    # Group candles by calendar date
+    days_map = defaultdict(list)
+    for c in candles:
+        dt = datetime.fromtimestamp(c["ts"])
+        days_map[dt.date()].append(c)
+
+    sorted_dates = sorted(days_map.keys())
+
+    days = []
+    for i, date in enumerate(sorted_dates):
+        day_candles = sorted(days_map[date], key=lambda x: x["ts"])
+        slots = {}
+
+        # Build slots with cumulative intra-day VWAP
+        cum_tp_vol, cum_vol = 0.0, 0.0
+        for c in day_candles:
+            dt = datetime.fromtimestamp(c["ts"])
+            slot_key = dt.strftime("%H:%M")
+            vol = c["volume"] or 0
+            tp  = (c["high"] + c["low"] + c["close"]) / 3
+            cum_tp_vol += tp * vol
+            cum_vol    += vol
+            slots[slot_key] = {
+                "price":  c["close"],
+                "open":   c["open"],
+                "high":   c["high"],
+                "low":    c["low"],
+                "vwap":   round(cum_tp_vol / cum_vol, 2) if cum_vol > 0 else c["close"],
+                "volume": vol,
             }
-        else:
-            current_slot["high"] = max(current_slot["high"], c["high"])
-            current_slot["low"] = min(current_slot["low"], c["low"])
-            current_slot["close"] = c["close"]
-            current_slot["volume"] += c["volume"]
-    if current_slot: aggregated_slots.append(current_slot)
+
+        # NextDayOpen = open of next trading day's first candle
+        if i + 1 < len(sorted_dates):
+            next_candles = sorted(days_map[sorted_dates[i + 1]], key=lambda x: x["ts"])
+            if next_candles:
+                slots["NextDayOpen"] = {
+                    "price": next_candles[0]["open"],
+                    "vwap": None, "volume": None,
+                }
+
+        days.append({"date": date.strftime("%Y-%m-%d"), "slots": slots})
+
+    elapsed_ms = round((time.perf_counter() - t_start) * 1000)
+    logging.info(f"[{'DB_CACHE' if source == 'DB_CACHE' else 'BROKER_API'}] simulate {symbol} tf={timeframe}m | {len(days)} days | {elapsed_ms}ms")
+
+    return {
+        "s": "ok",
+        "fetch_meta": {
+            "source": source,
+            "elapsed_ms": elapsed_ms,
+            "fetched_at": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+        },
+        "sim_data": {
+            "symbol": symbol,
+            "timeframe": timeframe,
+            "days": days,
+        },
+    }
+
+
+
+@router.get("/historical-regime")
+
+async def get_historical_regime(symbol: str, start_date: str, end_date: str, timeframe: int = 25):
+    """Fetches historical data, aggregates slots, and performs Regime Analysis.
     
+    Uses HistoricalDataStore — persists per-timeframe candles so repeated calls
+    are served from DB with no broker fetch.
+    """
+    if not state.active_broker:
+        raise HTTPException(status_code=400, detail="No active broker session")
+
+    from app.core.historical_store import HistoricalDataStore
+    from app.core.regime_analyzer import RegimeAnalyzer
+    from app.core.microstructure import MicrostructureAnalyzer
+    import pandas as pd
+
+    store = HistoricalDataStore()
+    broker_interval = "1" if state.active_broker_name == "FYERS" else "minute"
+
+    start_dt = datetime.strptime(start_date, "%Y-%m-%d")
+    end_dt   = datetime.strptime(end_date, "%Y-%m-%d").replace(hour=23, minute=59, second=59)
+    if end_dt > datetime.now():
+        end_dt = datetime.now()
+
+    # 1. Identify & fill missing gaps
+    gaps = store.get_missing_gaps(symbol, timeframe, start_dt, end_dt)
+    for gap_start, gap_end in gaps:
+        try:
+            raw = await state.active_broker.fetch_history(
+                symbol, broker_interval,
+                gap_start.strftime("%Y-%m-%d"),
+                gap_end.strftime("%Y-%m-%d"),
+            )
+            if raw:
+                agg = HistoricalDataStore.aggregate_raw_to_slots(raw, timeframe)
+                store.save_aggregated_candles(symbol, timeframe, agg)
+                store.update_coverage(symbol, timeframe, gap_start, gap_end)
+                logging.info(f"[HistoricalStore/regime] {len(agg)} candles stored for {symbol}")
+        except Exception as e:
+            logging.error(f"[HistoricalStore/regime] Gap fetch error {symbol}: {e}")
+
+    # 2. Read from DB
+    rows = store.get_candles(symbol, timeframe, start_dt, end_dt)
+    if not rows:
+        return {"s": "error", "message": "No data found for this range."}
+
+    # Convert to the format RegimeAnalyzer expects
+    aggregated_slots = [
+        {
+            "timestamp": datetime.fromtimestamp(r["ts"]).strftime("%d-%m-%Y %H:%M"),
+            "open":  r["open"],
+            "high":  r["high"],
+            "low":   r["low"],
+            "close": r["close"],
+            "volume": r["volume"],
+        }
+        for r in rows
+    ]
+
     if not aggregated_slots:
         return {"s": "error", "message": "No valid trading slots found."}
-        
+
     df = pd.DataFrame(aggregated_slots)
-    df = RegimeAnalyzer.apply_regime_logic(df)
-    payload = RegimeAnalyzer.generate_dashboard_payload(df)
-    
-    # Enrichment with 52-week benchmarks & LTP
+    df_regime = RegimeAnalyzer.apply_regime_logic(df.copy())
+    payload   = RegimeAnalyzer.generate_dashboard_payload(df_regime)
+
+    micro_data = MicrostructureAnalyzer.calculate_shape(df.copy())
+    micro_data["symbol"]     = symbol
+    micro_data["start_date"] = start_date
+    micro_data["end_date"]   = end_date
+    payload["microstructure"] = micro_data
+
     payload["summary"]["symbol"] = symbol
-    payload["summary"]["ltp"] = df['close'].iloc[-1] if not df.empty else 0
-    
+    payload["summary"]["ltp"]    = df["close"].iloc[-1] if not df.empty else 0
+
     try:
         quotes = await state.active_broker.get_quotes([symbol])
         if quotes:
             q = quotes[0]
             payload["summary"]["high_52week"] = q.get("high_52week", 0)
-            payload["summary"]["low_52week"] = q.get("low_52week", 0)
+            payload["summary"]["low_52week"]  = q.get("low_52week",  0)
             if q.get("ltp"):
                 payload["summary"]["ltp"] = q.get("ltp")
     except Exception as e:
         logging.error(f"Failed to enrich regime payload with 52w benchmarks: {e}")
-    
+
     payload["s"] = "ok"
     return payload
 @router.post("/bulk-phase-scan")
 async def bulk_phase_scan(data: dict):
     """
     Ranks multiple symbols by their phase performance.
-    Request: { symbols: [...], start_date, end_date }
+    Request: { symbols: [...], start_date, end_date, timeframe (optional, default 25) }
+    
+    Now uses HistoricalDataStore — fetched data is persisted so watchlist re-scans
+    do not re-fetch from broker for already-cached ranges.
     """
     if not state.active_broker:
         raise HTTPException(status_code=400, detail="No active broker session")
-    
-    symbols = data.get("symbols", [])
+
+    symbols    = data.get("symbols", [])
     start_date = data.get("start_date")
-    end_date = data.get("end_date")
-    
+    end_date   = data.get("end_date")
+    timeframe  = int(data.get("timeframe", 25))
+
     if not symbols or not start_date or not end_date:
         raise HTTPException(status_code=400, detail="Missing required scan parameters")
 
     from app.core.phases import PhaseEngine
+    from app.core.historical_store import HistoricalDataStore
+    store = HistoricalDataStore()
+    broker_interval = "1" if state.active_broker_name == "FYERS" else "minute"
+
+    start_dt = datetime.strptime(start_date, "%Y-%m-%d")
+    end_dt   = datetime.strptime(end_date, "%Y-%m-%d").replace(hour=23, minute=59, second=59)
+    if end_dt > datetime.now():
+        end_dt = datetime.now()
+
     results = {}
-    
-    # Standardize interval
-    interval = "1" if state.active_broker_name == "FYERS" else "minute"
-    
-    # Process symbols in batches to respect rate limits
     for sym in symbols:
         try:
-            raw_candles = await state.active_broker.fetch_history(sym, interval, start_date, end_date)
-            
-            # Use a simplified aggregator for the scan
-            aggregated = []
-            current = None
-            for c in raw_candles:
-                dt = c.get('timestamp') or c.get('date')
-                if not isinstance(dt, datetime):
-                    dt = datetime.fromtimestamp(int(dt)) if isinstance(dt, (int, str)) else dt
-                
-                m_start = dt.replace(hour=9, minute=15, second=0, microsecond=0)
-                m_end = dt.replace(hour=15, minute=30, second=0, microsecond=0)
-                if dt < m_start or dt >= m_end: continue
-                
-                # 25-min slots for consistency with dashboard
-                slot_idx = int(((dt - m_start).total_seconds() / 60) // 25)
-                label = (m_start + timedelta(minutes=slot_idx * 25)).strftime("%H:%M")
-                
-                if not current or current["label"] != label:
-                    if current: aggregated.append(current)
-                    current = {
-                        "label": label, 
-                        "epoch": int(dt.timestamp()), # Added epoch for day-grouping
-                        "open": c['open'], 
-                        "high": c['high'], 
-                        "low": c['low'], 
-                        "close": c['close'], 
-                        "volume": c['volume']
-                    }
-                else:
-                    current["high"] = max(current["high"], c['high'])
-                    current["low"] = min(current["low"], c['low'])
-                    current["close"] = c['close']
-                    current["volume"] += c['volume']
-            if current: aggregated.append(current)
-            
+            # 1. Find missing gaps for this symbol
+            gaps = store.get_missing_gaps(sym, timeframe, start_dt, end_dt)
+            for gap_start, gap_end in gaps:
+                try:
+                    raw = await state.active_broker.fetch_history(
+                        sym, broker_interval,
+                        gap_start.strftime("%Y-%m-%d"),
+                        gap_end.strftime("%Y-%m-%d"),
+                    )
+                    if raw:
+                        agg = HistoricalDataStore.aggregate_raw_to_slots(raw, timeframe)
+                        store.save_aggregated_candles(sym, timeframe, agg)
+                        store.update_coverage(sym, timeframe, gap_start, gap_end)
+                except Exception as fe:
+                    logging.error(f"[BulkScan] fetch error {sym}: {fe}")
+
+            # 2. Read from DB
+            rows = store.get_candles(sym, timeframe, start_dt, end_dt)
+            aggregated = [
+                {
+                    "label": datetime.fromtimestamp(r["ts"]).strftime("%d-%m-%Y %H:%M"),
+                    "epoch": r["ts"],
+                    "open":  r["open"],
+                    "high":  r["high"],
+                    "low":   r["low"],
+                    "close": r["close"],
+                    "volume": r["volume"],
+                }
+                for r in rows
+            ]
             if aggregated:
                 results[sym] = PhaseEngine.calculate_stats(aggregated)
         except Exception as e:
-            logging.error(f"Scan error for {sym}: {e}")
+            logging.error(f"[BulkScan] scan error {sym}: {e}")
             continue
 
-    # Transpose for easier UI consumption (Phase -> Symbol Stats)
+    # Transpose: Phase → List[Symbol Stats]
     transposed = {p["name"]: [] for p in PhaseEngine.PHASE_BOUNDS}
     for sym, phases in results.items():
         for p_name, stats in phases.items():
@@ -328,8 +464,7 @@ async def bulk_phase_scan(data: dict):
                 entry = stats.copy()
                 entry["symbol"] = sym
                 transposed[p_name].append(entry)
-                
-    # Sort each phase by Trend Strength (Persistence) by default
+
     for p_name in transposed:
         transposed[p_name].sort(key=lambda x: x.get("persistence", 0), reverse=True)
 
@@ -531,6 +666,55 @@ async def get_market_snapshot(watchlist: str = "Default", db: AsyncSession = Dep
         "market_status": MarketCalendar.get_market_status()[0],
         "quotes": all_quotes
     }
+
+@router.get("/instrument-info")
+async def get_instrument_info(symbol: str, db: AsyncSession = Depends(get_async_db)):
+    """Returns lot size and instrument type for a symbol."""
+    from sqlalchemy import select
+    from app.models.instrument import Instrument
+    
+    # Clean symbol: "NSE:SBIN-EQ" -> "SBIN"
+    # Also handle F&O: "ASHOKLEY26APRFUT" -> "ASHOKLEY"
+    base_symbol = symbol.split(':')[-1].split('-')[0]
+    
+    # Strip F&O suffixes like 26APRFUT, 26APR23000CE, etc.
+    import re
+    # 1. Strip date patterns like 26APR, 25MAY, etc.
+    match = re.search(r'\d{2}[A-Z]{3}', base_symbol)
+    if match:
+        base_symbol = base_symbol[:match.start()]
+    
+    # 2. Safety strip common suffixes if they somehow remain
+    for suffix in ['FUT', 'CE', 'PE']:
+        if base_symbol.endswith(suffix):
+            base_symbol = base_symbol[:-len(suffix)]
+
+    query = select(Instrument).where(Instrument.symbol == base_symbol)
+    result = await db.execute(query)
+    inst = result.scalar_one_or_none()
+    
+    if inst:
+        return {
+            "symbol": symbol,
+            "base_symbol": base_symbol,
+            "lot_size": inst.lot_size,
+            "type": inst.instrument_type or "EQ"
+        }
+    
+    # Default fallback for unknown symbols
+    return {
+        "symbol": symbol,
+        "base_symbol": base_symbol,
+        "lot_size": 1,
+        "type": "EQ"
+    }
+
+@router.post("/sync-fno-lots")
+async def sync_fno_lots(db: AsyncSession = Depends(get_async_db)):
+    """Triggers F&O lot size synchronization from internal seed or NSE."""
+    from app.core.fno_sync import FnoSyncManager
+    count = await FnoSyncManager.sync_all(db)
+    return {"status": "success", "updated_count": count}
 
 @router.get("/full-state")
 async def get_full_state():

@@ -25,6 +25,19 @@ async def init_async_db():
         from app.models.slot import SlotData
         await conn.run_sync(Base.metadata.create_all)
 
+        # ─── Safe Auto-Migration ──────────────────────────────────────────────
+        # Adds new columns to existing tables without dropping data.
+        # SQLite does not support IF NOT EXISTS for ALTER TABLE, so we catch errors.
+        for migration_sql in [
+            "ALTER TABLE instruments ADD COLUMN lot_size INTEGER DEFAULT 1",
+            "ALTER TABLE instruments ADD COLUMN instrument_type TEXT",
+        ]:
+            try:
+                await conn.execute(text(migration_sql))
+            except Exception:
+                pass  # Column already exists — safe to ignore
+
+
 # Global session maker
 AsyncSessionLocal = async_sessionmaker(
     bind=engine,

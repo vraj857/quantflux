@@ -453,7 +453,7 @@ const App = () => {
                 <div className={clsx("flex-1 overflow-auto", activeView === 'backtest' ? "flex flex-col" : "hidden")}>
                     <BacktestView theme={theme} activeView={activeView} />
                 </div>
-                {activeView === 'simulator' && <PhaseSimulatorView theme={theme} />}
+                {activeView === 'simulator' && <PhaseSimulatorView theme={theme} activeView={activeView} />}
                 {activeView === 'orders' && <OrderConsole theme={theme} />}
                 {activeView === 'settings' && <SettingsView theme={theme} onAuthSuccess={handleAuthSuccess} />}
 
