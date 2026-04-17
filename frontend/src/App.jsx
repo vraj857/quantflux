@@ -14,7 +14,7 @@ import PhaseSimulatorView from './components/features/simulator/PhaseSimulatorVi
 import OrderConsole from './components/features/analytics/OrderConsole';
 import BrokerLoginGate from './components/layout/BrokerLoginGate';
 import { useMarketData } from './hooks/useMarketData';
-import { Monitor, History, LayoutDashboard, Zap, ShieldCheck, Settings as SettingsIcon, Play, Target, Maximize2, Minimize2 } from 'lucide-react';
+import { Monitor, History, LayoutDashboard, Zap, ShieldCheck, Settings as SettingsIcon, Play, Target, Maximize2, Minimize2, User } from 'lucide-react';
 
 import { clsx } from 'clsx';
 import { api } from './api';
@@ -314,31 +314,42 @@ const App = () => {
                     <div className="flex items-center space-x-4">
                         {brokerProfile?.user_name ? (
                             <div className={clsx(
-                                "flex items-center space-x-3 px-4 py-2 rounded-xl border",
-                                theme === 'dark' ? "bg-indigo-500/10 border-indigo-500/20" : "bg-indigo-50 border-indigo-200"
+                                "flex items-center space-x-3 px-4 py-2 rounded-xl border transition-all hover:bg-white/[0.02]",
+                                theme === 'dark' ? "bg-indigo-500/10 border-indigo-500/20 shadow-[0_0_20px_rgba(79,70,229,0.1)]" : "bg-indigo-50 border-indigo-200"
                             )}>
-                                <div className="size-7 rounded-full bg-indigo-600 flex items-center justify-center shadow-md shrink-0">
-                                    <span className="text-white font-black text-[10px]">
+                                <div className="size-8 rounded-full bg-indigo-600 flex items-center justify-center shadow-lg shrink-0 border border-white/10">
+                                    <span className="text-white font-black text-[11px] tracking-tighter">
                                         {brokerProfile.user_name.charAt(0).toUpperCase()}
                                     </span>
                                 </div>
                                 <div className="flex flex-col">
-                                    <span className={clsx("text-xs font-black tracking-tight leading-none", theme === 'dark' ? "text-white" : "text-gray-900")}>
-                                        {brokerProfile.user_name}
-                                    </span>
-                                    <span className="text-[9px] font-bold text-indigo-400 tracking-widest uppercase leading-none mt-0.5">
+                                    <div className="flex items-center space-x-1.5">
+                                        <span className={clsx("text-xs font-black tracking-tight leading-none", theme === 'dark' ? "text-white" : "text-gray-900")}>
+                                            {brokerProfile.user_name}
+                                        </span>
+                                        <div className="size-1 bg-emerald-500 rounded-full animate-pulse shadow-[0_0_6px_rgba(52,211,153,0.8)]" />
+                                    </div>
+                                    <span className="text-[9px] font-bold text-indigo-400/80 tracking-widest uppercase leading-none mt-1">
                                         {brokerProfile.broker} · {brokerProfile.user_id}
                                     </span>
                                 </div>
                             </div>
                         ) : (
                             <div className={clsx(
-                                "flex items-center space-x-2 px-3 py-1.5 rounded-xl border bg-indigo-500/10 border-indigo-500/30"
+                                "flex items-center space-x-3 px-3 py-1.5 rounded-xl border animate-in fade-in duration-500",
+                                theme === 'dark' ? "bg-indigo-500/5 border-white/5" : "bg-gray-100 border-gray-200"
                             )}>
-                                <div className="size-1.5 rounded-full bg-indigo-400 animate-pulse"></div>
-                                <span className="text-[10px] font-black uppercase tracking-widest text-indigo-300">
-                                    {session.broker} Session
-                                </span>
+                                <div className="size-6 rounded-full bg-zinc-800 flex items-center justify-center border border-white/5">
+                                    <User size={12} className="text-gray-500" />
+                                </div>
+                                <div className="flex flex-col">
+                                    <span className={clsx("text-[10px] font-black uppercase tracking-widest leading-none", theme === 'dark' ? "text-indigo-300" : "text-indigo-600")}>
+                                        {session?.broker || 'No'} Session
+                                    </span>
+                                    <span className="text-[7px] font-black text-gray-500 uppercase tracking-widest leading-none mt-0.5 animate-pulse">
+                                        Initializing Profile...
+                                    </span>
+                                </div>
                             </div>
                         )}
                     </div>

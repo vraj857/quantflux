@@ -24,6 +24,8 @@ class FyersAdapter(IBroker):
         self.on_tick_callback: Optional[callable] = None
         self.ws_connected: bool = False
         self.symbols_to_subscribe: List[str] = []
+        self.profile: Optional[Dict[str, Any]] = None # Cached profile
+        self.client_id_cached: Optional[str] = None # Cached client ID
         self._last_tick_times: Dict[str, datetime] = {}
         self.loop: Optional[asyncio.AbstractEventLoop] = None # Store main loop handle
         
@@ -75,11 +77,13 @@ class FyersAdapter(IBroker):
         profile = await asyncio.to_thread(self.api.get_profile)
         if profile.get("s") == "ok":
             data = profile.get("data", {})
-            return {
+            self.profile = {
                 "name": data.get("name"),
                 "client_id": data.get("fy_id"),
                 "email": data.get("email_id")
             }
+            self.client_id_cached = self.profile["client_id"]
+            return self.profile
         return {}
 
     def _normalize_date(self, date_str: str) -> str:
@@ -229,15 +233,31 @@ class FyersAdapter(IBroker):
         logging.info("Fyers WS Connection Closed")
 
     async def stop_ticker(self):
-        if self.ws:
-            try:
+        """
+        Hard-stops the WebSocket ticker with a universal exception shield.
+        Catching BaseException is critical to prevent SDK-level SystemExit signals 
+        from shutting down the entire FastAPI server.
+        """
+        self.on_tick_callback = None # Immediately kill processing loop
+        
+        try:
+            if self.ws:
+                logging.info(f"Fyers Adapter: Requesting disconnect for {len(self.symbols_to_subscribe)} symbols...")
+                
+                # Close socket directly (the SDK handles its own internal teardown)
+                # We use a direct call if possible or to_thread for safety
                 await asyncio.to_thread(self.ws.close)
-            except Exception as e:
-                logging.error(f"Error closing Fyers WS: {e}")
-            finally:
-                self.ws = None
-        self.ws_connected = False
-        self.symbols_to_subscribe = []
+                logging.info("Fyers Adapter: WebSocket close command issued.")
+                    
+        except BaseException as e:
+            # Catching BaseException handles SystemExit/KeyboardInterrupt which normal 'Exception' misses
+            logging.error(f"Fyers Adapter: Intercepted SDK-level shutdown signal: {type(e).__name__}")
+        finally:
+            self.ws = None
+            self.ws_connected = False
+            self.symbols_to_subscribe = []
+            self._reverse_symbol_map = {}
+            logging.info("Fyers Adapter: Local state reset complete.")
 
     def is_connected(self) -> bool:
         return self.access_token is not None

@@ -1,4 +1,4 @@
-from fastapi import APIRouter, Depends, HTTPException, Query
+from fastapi import APIRouter, Depends, HTTPException, Query, BackgroundTasks
 import urllib.parse
 from fastapi.responses import RedirectResponse
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -261,16 +261,20 @@ async def get_broker_profile(db: AsyncSession = Depends(get_async_db)):
     # 1. Fast path: check in-memory state first
     if state.active_broker is not None:
         try:
-            # We don't want to hit the broker API here every time to save latency,
-            # so we just return what we have if the token is likely still valid.
-            # get_session_status handles the actual validation.
+            # Check for cached profile
+            if not getattr(state.active_broker, 'profile', None):
+                logging.info("Profile: In-memory broker has no cached profile. Fetching...")
+                await state.active_broker.get_profile()
+
+            profile = getattr(state.active_broker, 'profile', {})
             return {
                 "authenticated": True,
                 "broker": state.active_broker_name,
-                "user_name": state.active_broker.profile.get("name") if hasattr(state.active_broker, 'profile') and state.active_broker.profile else None,
-                "user_id": state.active_broker.client_id if hasattr(state.active_broker, 'client_id') else None
+                "user_name": profile.get("name"),
+                "user_id": profile.get("client_id") or getattr(state.active_broker, 'client_id_cached', None)
             }
-        except Exception:
+        except Exception as e:
+            logging.warning(f"Profile: Fast path fetch error: {e}")
             pass
 
     # 2. Slow path: Restore from DB
@@ -295,27 +299,26 @@ async def get_broker_profile(db: AsyncSession = Depends(get_async_db)):
     }
 
 @router.post("/logout")
-async def logout(db: AsyncSession = Depends(get_async_db)):
-    """Logs out the current session: stops ticker, clears in-memory broker, marks DB sessions inactive."""
+async def logout(background_tasks: BackgroundTasks, db: AsyncSession = Depends(get_async_db)):
+    """Logs out the current session: stops ticker (bg), clears state, marks DB sessions inactive."""
     from sqlalchemy import update
     try:
-        # Stop active ticker if running
+        # 1. Schedule ticker stop as a background task
+        # This prevents SDK-level crashes/signals from killing the main API response
         if state.active_broker and hasattr(state.active_broker, 'stop_ticker'):
-            try:
-                await state.active_broker.stop_ticker()
-            except Exception:
-                pass
+            background_tasks.add_task(state.active_broker.stop_ticker)
 
-        # Clear in-memory state
+        # 2. Hard-reset in-memory state immediately
         state.active_broker = None
         state.active_broker_name = None
 
-        # Mark all DB sessions as inactive
+        # 3. Mark all DB sessions as inactive
         await db.execute(
             update(BrokerSession).values(session_active=0)
         )
         await db.commit()
-        logging.info("User logged out. All sessions cleared.")
+        
+        logging.info("Logout: User session cleared. Broker shutdown scheduled in background.")
         return {"status": "success", "message": "Logged out successfully."}
     except Exception as e:
         logging.error(f"Logout error: {e}")

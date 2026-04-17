@@ -1,6 +1,6 @@
 """
 QuantFlux Production API - Enterprise Main Entry Point
-Version: 2.0.0
+Version: 2.6.0
 Author: Senior Architect
 Description: Orchestrates FastAPI routing, WebSocket real-time heartbeats, 
              and asynchronous background synchronization for high-fidelity trading data.

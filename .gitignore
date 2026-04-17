@@ -5,6 +5,14 @@ Thumbs.db
 *.tmp
 *.bak
 
+# Sensitive Info & Credentials
+.env
+*.env.*
+!.env.example
+*.pem
+*.key
+*.cert
+
 # IDEs
 .vscode/
 .idea/
