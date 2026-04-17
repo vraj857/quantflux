@@ -1,6 +1,6 @@
-import React, { memo, useMemo } from 'react';
+import React, { memo, useMemo, useState } from 'react';
 import { clsx } from 'clsx';
-import { Zap, AlertCircle, Radio, Wifi, WifiOff, Monitor, History } from 'lucide-react';
+import { Zap, AlertCircle, Radio, Wifi, WifiOff, Monitor, History, Search } from 'lucide-react';
 import { TIME_SLOTS_25, PHASES_25, METRIC_CONFIG, getDynamicPhases } from '../../../constants';
 
 // ─── Phase Mapping Helpers ──────────────────────────────────────────────────
@@ -167,14 +167,22 @@ const MetricRow = memo(({ symbol, metric, data, isFirst, theme, slotCount, daily
 
 
 const LiveFeedGrid = ({ data, snapshot, subscriptions, theme }) => {
+    const [searchQuery, setSearchQuery] = useState('');
+    
     // ── Symbols to display: Prefer live data, fallback to subscriptions/snapshot ──
     const symbolsFromData = Object.keys(data?.data || {});
     const symbolsFromSubs = (subscriptions?.symbols || []).map(s => s.replace(/-EQ$/, ''));
     const symbolsFromSnap = (snapshot?.quotes || []).map(q => q.symbol);
     
     // Unified unique symbol list for the grid rows
-    const symbols = symbolsFromData.length > 0 ? symbolsFromData : 
+    const allSymbols = symbolsFromData.length > 0 ? symbolsFromData : 
                    (symbolsFromSubs.length > 0 ? symbolsFromSubs : symbolsFromSnap);
+
+    const symbols = useMemo(() => {
+        if (!searchQuery) return allSymbols;
+        const q = searchQuery.toLowerCase();
+        return allSymbols.filter(sym => sym.toLowerCase().includes(q));
+    }, [allSymbols, searchQuery]);
 
     const slotLabels = data.slot_labels || TIME_SLOTS_25;
     const is25Min = slotLabels.length === 15;
@@ -244,10 +252,10 @@ const LiveFeedGrid = ({ data, snapshot, subscriptions, theme }) => {
     }
 
     return (
-        <div className="flex-1 overflow-auto p-4 scrollbar-hide">
+        <div className="flex-1 flex flex-col p-4 overflow-hidden">
             {/* Connection Banner & Data Vitality Pulse */}
             <div className={clsx(
-                "flex items-center justify-between px-5 py-3 rounded-2xl mb-4 border transition-all",
+                "flex items-center justify-between px-5 py-3 rounded-2xl mb-4 border transition-all shrink-0",
                 theme === 'dark' ? "bg-black/40 border-white/10" : "bg-gray-50 border-gray-200"
             )}>
                 <div className="flex items-center space-x-3">
@@ -289,19 +297,34 @@ const LiveFeedGrid = ({ data, snapshot, subscriptions, theme }) => {
             </div>
 
             <div className={clsx(
-                "rounded-3xl border shadow-2xl overflow-hidden backdrop-blur-md transition-all",
+                "flex-1 overflow-auto pb-32 scrollbar-hide rounded-3xl border shadow-2xl backdrop-blur-md transition-all relative",
                 theme === 'dark' ? "bg-black/40 border-white/5" : "bg-white border-gray-200"
             )}>
                 <table className="w-full border-collapse">
-                    <thead>
+                    <thead className={clsx(
+                        "sticky top-0 z-30 shadow-sm backdrop-blur-2xl",
+                        theme === 'dark' ? "bg-[#13131a]/95" : "bg-white/95"
+                    )}>
                         <tr>
                             <th colSpan={2} className={clsx(
-                                "p-2 border-b border-r text-left",
-                                theme === 'dark' ? "border-white/10 bg-black/60" : "border-gray-200 bg-gray-50"
+                                "p-2 border-b border-r text-left align-bottom",
+                                theme === 'dark' ? "border-white/10" : "border-gray-200"
                             )}>
-                                <div className="flex items-center space-x-2">
-                                    <div className="size-2 bg-indigo-500 rounded-full animate-pulse"></div>
-                                    <span className={clsx("text-[10px] font-black uppercase tracking-widest", theme === 'dark' ? "text-gray-400" : "text-gray-600")}>Instrument</span>
+                                <div className={clsx(
+                                    "flex items-center space-x-2 px-2 py-1.5 flex-1 rounded border",
+                                    theme === 'dark' ? "bg-black/40 border-white/10 focus-within:border-white/30" : "bg-white border-gray-200 focus-within:border-gray-400"
+                                )}>
+                                    <Search size={12} className={theme === 'dark' ? "text-gray-400" : "text-gray-500"} />
+                                    <input 
+                                        type="text"
+                                        placeholder="SEARCH INSTRUMENT"
+                                        value={searchQuery}
+                                        onChange={(e) => setSearchQuery(e.target.value)}
+                                        className={clsx(
+                                            "bg-transparent border-none outline-none text-[10px] font-black uppercase tracking-widest w-full",
+                                            theme === 'dark' ? "text-white placeholder-gray-600" : "text-gray-900 placeholder-gray-400"
+                                        )}
+                                    />
                                 </div>
                             </th>
                             {phases.map((phase, i) => (

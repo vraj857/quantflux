@@ -1,7 +1,7 @@
 {
     "name": "trading-platform-frontend",
     "private": true,
-    "version": "0.1.0",
+    "version": "2.6.0",
     "type": "module",
     "scripts": {
         "preinstall": "node -e \"const pkg=require('./package.json'); if(pkg.dependencies.axios !== '1.13.6'){ console.error('\\n\\x1b[41m\\x1b[37m SECURITY ALERT: AXIOS UPDATE BLOCKED \\x1b[0m\\nVersions 1.14.1 and 0.30.4 contain known malware (March 2026 Supply Chain Attack).\\nExpected: 1.13.6\\nFound: ' + pkg.dependencies.axios + '\\n\\nPlease revert axios in package.json to 1.13.6.\\n'); process.exit(1); }\"",

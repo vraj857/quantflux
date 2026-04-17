@@ -19,6 +19,8 @@ class ZerodhaAdapter(IBroker):
         self.api: Optional[Any] = None
         self.kws: Optional[Any] = None
         self.on_tick_callback: Optional[callable] = None
+        self.profile: Optional[Dict[str, Any]] = None # Cached profile
+        self.client_id_cached: Optional[str] = None # Cached client ID
         self._last_tick_times: Dict[str, datetime] = {}
         
         # Zerodha Rate Limit: ~3 requests per second for standard users
@@ -50,11 +52,13 @@ class ZerodhaAdapter(IBroker):
     async def get_profile(self) -> Dict[str, Any]:
         await self.rate_limiter.consume()
         profile = await asyncio.to_thread(self.api.profile)
-        return {
+        self.profile = {
             "name": profile.get("user_name"),
             "client_id": profile.get("user_id"),
             "email": profile.get("email")
         }
+        self.client_id_cached = self.profile["client_id"]
+        return self.profile
 
     async def fetch_history(self, symbol: str, interval: str, start: str, end: str) -> List[Dict[str, Any]]:
         await self.rate_limiter.consume()

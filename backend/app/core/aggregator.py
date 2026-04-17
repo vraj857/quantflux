@@ -452,11 +452,22 @@ class AggregationEngine:
             
             # Update Summary Cache
             prices = [p for p in data["price"] if p is not None]
+            current_price = prices[-1] if prices else 0
+            
+            # Overall Daily Change (Relative to first valid slot open at 09:15)
+            day_open = data.get("price_open", [None])[0]
+            if day_open is None:
+                # Fallback to current slot's open if early in the session or backfill in progress
+                day_open = data.get("price_open", [current_price])[slot_idx] or current_price
+
+            overall_move = round(current_price - day_open, 2)
+            overall_pc = round((overall_move / day_open * 100), 2) if day_open > 0 else 0.0
+
             self._payload_cache["daily_summary"][sym] = {
-                "current_price": prices[-1] if prices else 0,
+                "current_price": current_price,
                 "total_volume": sum(data["volume"]),
-                "percent_change": data["percent_change"][slot_idx],
-                "price_move": data["price_move"][slot_idx]
+                "percent_change": overall_pc,
+                "price_move": overall_move
             }
         
         # Clear flags after synchronization
